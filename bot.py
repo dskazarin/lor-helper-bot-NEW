@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ЛОР-Помощник - Telegram бот для управления приемом лекарств и отслеживания симптомов
-Версия: 10.0.0 (Ultimate - полностью исправленная)
+Версия: 11.0.0 (Новая логика добавления)
 Автор: Денис Казарин (врач-оториноларинголог)
 """
 
@@ -598,7 +598,9 @@ class Medicine(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(BigInteger, nullable=False, index=True)
     name = Column(String(200), nullable=False)
-    schedule = Column(String(200), nullable=False)
+    frequency = Column(Integer, nullable=False, default=1)  # количество раз в день
+    times = Column(String(200), nullable=False)  # "08:00,20:00" или "08:00"
+    reminder_minutes = Column(Integer, nullable=True)  # за сколько минут напомнить
     start_date = Column(DateTime, nullable=True)
     end_date = Column(DateTime, nullable=True)
     user_timezone = Column(String(50), nullable=False)
@@ -621,9 +623,9 @@ class Analysis(Base):
     name = Column(String(200), nullable=False)
     scheduled_date = Column(DateTime, nullable=False)
     scheduled_time = Column(String(10), nullable=False, default='12:00')
+    reminder_minutes = Column(Integer, default=120)  # за сколько минут напомнить
     repeat_type = Column(String(20), default='once')
     repeat_interval = Column(Integer, nullable=True)
-    reminder_before = Column(Integer, default=24)  # в минутах
     notes = Column(Text, nullable=True)
     status = Column(String(20), default='pending')
     user_timezone = Column(String(50), nullable=False)
@@ -665,14 +667,14 @@ class MedicineLog(Base):
     taken_at = Column(DateTime(timezone=True), default=lambda: datetime.now(pytz.UTC))
     error_details = Column(Text, nullable=True)
     course_info = Column(Text, nullable=True)
-    is_planned = Column(Boolean, default=True)  # запланированный или внеплановый прием
+    is_planned = Column(Boolean, default=True)
 
 class AnalysisLog(Base):
     __tablename__ = 'analysis_logs'
     id = Column(Integer, primary_key=True)
     analysis_id = Column(Integer, nullable=False, index=True)
     user_id = Column(BigInteger, nullable=False)
-    status = Column(String(20))  # completed, skipped, postponed
+    status = Column(String(20))
     completed_at = Column(DateTime(timezone=True), default=lambda: datetime.now(pytz.UTC))
     notes = Column(Text, nullable=True)
 
@@ -750,6 +752,12 @@ def init_db():
         
         if 'medicines' in tables:
             med_columns = [c['name'] for c in inspector.get_columns('medicines')]
+            if 'frequency' not in med_columns:
+                db.execute(text('ALTER TABLE medicines ADD COLUMN frequency INTEGER DEFAULT 1'))
+                db.commit()
+            if 'reminder_minutes' not in med_columns:
+                db.execute(text('ALTER TABLE medicines ADD COLUMN reminder_minutes INTEGER'))
+                db.commit()
             if 'paused_until' not in med_columns:
                 db.execute(text('ALTER TABLE medicines ADD COLUMN paused_until DATETIME'))
                 db.commit()
@@ -759,8 +767,8 @@ def init_db():
             if 'paused_until' not in ana_columns:
                 db.execute(text('ALTER TABLE analyses ADD COLUMN paused_until DATETIME'))
                 db.commit()
-            if 'reminder_before' not in ana_columns:
-                db.execute(text('ALTER TABLE analyses ADD COLUMN reminder_before INTEGER DEFAULT 24'))
+            if 'reminder_minutes' not in ana_columns:
+                db.execute(text('ALTER TABLE analyses ADD COLUMN reminder_minutes INTEGER DEFAULT 120'))
                 db.commit()
         
         if 'reminders' in tables:
@@ -1027,6 +1035,20 @@ def get_mood_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
+def get_frequency_keyboard(prefix: str):
+    """Клавиатура для выбора количества раз в день."""
+    keyboard = [
+        [
+            InlineKeyboardButton("1 раз", callback_data=f"{prefix}_freq_1"),
+            InlineKeyboardButton("2 раза", callback_data=f"{prefix}_freq_2"),
+            InlineKeyboardButton("3 раза", callback_data=f"{prefix}_freq_3"),
+        ],
+        [InlineKeyboardButton("⚙️ Свой вариант", callback_data=f"{prefix}_freq_custom")],
+        [InlineKeyboardButton("🔙 Отмена", callback_data="start")],
+        get_main_menu_button()
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 def get_hour_keyboard(prefix: str, back_callback: str):
     """Клавиатура для выбора часа."""
     keyboard = []
@@ -1065,6 +1087,29 @@ def get_minute_keyboard(hour: str, prefix: str, back_callback: str):
     
     return InlineKeyboardMarkup(keyboard)
 
+def get_reminder_keyboard(prefix: str, back_callback: str):
+    """Клавиатура для выбора времени напоминания."""
+    keyboard = [
+        [
+            InlineKeyboardButton("⏰ 15 мин", callback_data=f"{prefix}_remind_15"),
+            InlineKeyboardButton("⏰ 30 мин", callback_data=f"{prefix}_remind_30"),
+            InlineKeyboardButton("⏰ 1 час", callback_data=f"{prefix}_remind_60"),
+        ],
+        [
+            InlineKeyboardButton("⏰ 2 часа", callback_data=f"{prefix}_remind_120"),
+            InlineKeyboardButton("⏰ 3 часа", callback_data=f"{prefix}_remind_180"),
+            InlineKeyboardButton("⏰ 6 часов", callback_data=f"{prefix}_remind_360"),
+        ],
+        [
+            InlineKeyboardButton("⏰ 12 часов", callback_data=f"{prefix}_remind_720"),
+            InlineKeyboardButton("⏰ 24 часа", callback_data=f"{prefix}_remind_1440"),
+            InlineKeyboardButton("⚙️ Свое", callback_data=f"{prefix}_remind_custom"),
+        ],
+        [InlineKeyboardButton("🔙 Назад", callback_data=back_callback)],
+        get_main_menu_button()
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 def get_simple_date_keyboard():
     """Простая клавиатура для выбора даты."""
     today = datetime.now()
@@ -1083,27 +1128,6 @@ def get_simple_date_keyboard():
     keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="start")])
     keyboard.append(get_main_menu_button())
     
-    return InlineKeyboardMarkup(keyboard)
-
-def get_day_keyboard(callback_prefix: str, back_callback: str):
-    """Клавиатура для выбора дней."""
-    keyboard = [
-        [
-            InlineKeyboardButton("5 дней", callback_data=f"{callback_prefix}_day_5"),
-            InlineKeyboardButton("10 дней", callback_data=f"{callback_prefix}_day_10"),
-        ],
-        [
-            InlineKeyboardButton("15 дней", callback_data=f"{callback_prefix}_day_15"),
-            InlineKeyboardButton("30 дней", callback_data=f"{callback_prefix}_day_30"),
-        ],
-        [
-            InlineKeyboardButton("⚙️ Свой вариант", callback_data=f"{callback_prefix}_day_custom"),
-        ],
-        [
-            InlineKeyboardButton("🔙 Назад", callback_data=back_callback),
-            get_main_menu_button()[0]
-        ]
-    ]
     return InlineKeyboardMarkup(keyboard)
 
 def get_symptom_list_keyboard(user_id: int, page: int = 0):
@@ -1140,13 +1164,24 @@ def get_symptom_list_keyboard(user_id: int, page: int = 0):
     finally:
         db.close()
 
-def get_stats_detail_keyboard(data_type: str, user_id: int):
-    """Клавиатура для просмотра детальной статистики."""
+def get_postpone_keyboard(item_type: str, item_id: int):
+    """Клавиатура для выбора срока откладывания."""
     keyboard = [
-        [InlineKeyboardButton("📊 Показать все записи", callback_data=f"stats_{data_type}_all")],
-        [InlineKeyboardButton("📅 По дням", callback_data=f"stats_{data_type}_days")],
-        [InlineKeyboardButton("🕐 По времени", callback_data=f"stats_{data_type}_time")],
-        get_main_menu_button()
+        [
+            InlineKeyboardButton("5 дней", callback_data=f"postpone_{item_type}_{item_id}_5"),
+            InlineKeyboardButton("10 дней", callback_data=f"postpone_{item_type}_{item_id}_10"),
+        ],
+        [
+            InlineKeyboardButton("15 дней", callback_data=f"postpone_{item_type}_{item_id}_15"),
+            InlineKeyboardButton("30 дней", callback_data=f"postpone_{item_type}_{item_id}_30"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ Свой вариант", callback_data=f"postpone_{item_type}_{item_id}_custom"),
+        ],
+        [
+            InlineKeyboardButton("🔙 Назад", callback_data=f"back_to_{item_type}_{item_id}"),
+            get_main_menu_button()[0]
+        ]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -1200,30 +1235,16 @@ def get_admin_backups_keyboard():
 
 # ============== СОСТОЯНИЯ CONVERSATION HANDLER ==============
 (
-    MEDICINE_NAME,              # 0
-    MEDICINE_TIME_HOUR,         # 1
-    MEDICINE_TIME_MINUTE,       # 2
-    MEDICINE_CONFIRM,           # 3
-    ANALYSIS_NAME,              # 4
-    ANALYSIS_DATE,              # 5
-    ANALYSIS_TIME_HOUR,         # 6
-    ANALYSIS_TIME_MINUTE,       # 7
-    ANALYSIS_CONFIRM,           # 8
-    SYMPTOM_TEXT,               # 9
-    SYMPTOM_SEVERITY,           # 10
-    MEDICINE_COMMENT,           # 11
-    MEDICINE_DOSAGE,            # 12
-    MEDICINE_EXTRA_REASON,      # 13
-    POSTPONE_MEDICINE_DAYS,     # 14
-    POSTPONE_ANALYSIS_HOURS,    # 15
-    POSTPONE_ANALYSIS_DAYS,     # 16
-    PAUSE_MEDICINE_DAYS,        # 17
-    PAUSE_ANALYSIS_DAYS,        # 18
-    EXTRA_MEDICINE_SELECT,      # 19
-    ADMIN_BROADCAST_MESSAGE,    # 20
-    ADMIN_BROADCAST_CONFIRM,    # 21
-    ADMIN_USER_SEARCH           # 22
-) = range(23)  # 23 состояния (0-22)
+    MEDICINE_NAME, MEDICINE_FREQUENCY, MEDICINE_TIME, MEDICINE_REMINDER, MEDICINE_CONFIRM,
+    ANALYSIS_NAME, ANALYSIS_DATE, ANALYSIS_TIME, ANALYSIS_REMINDER, ANALYSIS_CONFIRM,
+    SYMPTOM_TEXT, SYMPTOM_SEVERITY,
+    MEDICINE_COMMENT, MEDICINE_DOSAGE, MEDICINE_EXTRA_REASON,
+    POSTPONE_MEDICINE, POSTPONE_ANALYSIS,
+    PAUSE_MEDICINE, PAUSE_ANALYSIS,
+    EXTRA_MEDICINE_SELECT,
+    ADMIN_BROADCAST_MESSAGE, ADMIN_BROADCAST_CONFIRM,
+    ADMIN_USER_SEARCH
+) = range(23)
 
 # ============== ОБРАБОТЧИКИ КОМАНД ==============
 
@@ -1273,10 +1294,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 📖 Быстрый старт:
 1️⃣ Добавьте лекарство - нажмите кнопку "💊 Добавить лекарство"
-2️⃣ Укажите время приема - выберите из списка или введите свое
-3️⃣ Получайте напоминания - бот напомнит вовремя
+2️⃣ Укажите сколько раз в день
+3️⃣ Выберите время приема
+4️⃣ Укажите за сколько напомнить
 
-🩺 Для анализов - аналогично, нажмите "🩺 Добавить анализ"
+🩺 Для анализов - аналогично
 
 📊 Отслеживайте самочувствие - кнопка "📊 Самочувствие"
 
@@ -1297,16 +1319,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help."""
     text = """❓ Как очистить историю переписки
 
-Чтобы удалить всю переписку с ботом:
+Чтобы удалить всю переписку с ботом и вернуться на главную:
 
 1️⃣ В правом верхнем углу нажмите на свой профиль
 2️⃣ В меню выберите пункт "Еще" (или "More")
 3️⃣ Прокрутите вниз и нажмите "Удалить переписку" (или "Delete chat")
 
 ✅ После этого откроется начальная страница бота
-💾 Все ваши сохраненные данные (лекарства, анализы, статистика) останутся без изменений
+💾 Все ваши сохраненные данные останутся без изменений
 
-Ваши данные в безопасности!"""
+👇 Нажмите синюю кнопку START внизу чтобы вернуться к боту"""
 
     if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=get_about_keyboard(), parse_mode=None)
@@ -1340,69 +1362,170 @@ async def add_medicine_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     
     context.user_data.clear()
+    context.user_data['medicine'] = {}
+    
     await query.edit_message_text(
-        "💊 *Добавление лекарства*\n\nШаг 1/6: Введите название лекарства",
+        "💊 *Добавление лекарства*\n\nШаг 1/5: Введите название лекарства",
         parse_mode=None
     )
     return MEDICINE_NAME
 
 async def add_medicine_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получение названия лекарства."""
-    context.user_data['medicine'] = {'name': update.message.text}
+    context.user_data['medicine']['name'] = update.message.text
     
     await update.message.reply_text(
-        "Шаг 2/6: Выберите час:",
-        reply_markup=get_hour_keyboard("med", "start"),
+        "Шаг 2/5: Сколько раз в день принимать?",
+        reply_markup=get_frequency_keyboard("med"),
         parse_mode=None
     )
-    return MEDICINE_TIME_HOUR
+    return MEDICINE_FREQUENCY
 
-async def add_medicine_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор часа."""
+async def add_medicine_frequency(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор количества приемов в день."""
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "med_freq_custom":
+            await query.edit_message_text(
+                "Введите количество раз в день (от 1 до 10):",
+                parse_mode=None
+            )
+            return MEDICINE_FREQUENCY
+        
+        freq = int(query.data.replace("med_freq_", ""))
+        context.user_data['medicine']['frequency'] = freq
+        context.user_data['medicine']['times'] = []
+        
+        await query.edit_message_text(
+            f"Шаг 3/5: Выберите час для приема №1 из {freq}",
+            reply_markup=get_hour_keyboard("med_time", "start"),
+            parse_mode=None
+        )
+        return MEDICINE_TIME
+    else:
+        try:
+            freq = int(update.message.text.strip())
+            if freq < 1 or freq > 10:
+                raise ValueError
+            context.user_data['medicine']['frequency'] = freq
+            context.user_data['medicine']['times'] = []
+            
+            await update.message.reply_text(
+                f"Шаг 3/5: Выберите час для приема №1 из {freq}",
+                reply_markup=get_hour_keyboard("med_time", "start"),
+                parse_mode=None
+            )
+            return MEDICINE_TIME
+        except:
+            await update.message.reply_text("❌ Введите число от 1 до 10")
+            return MEDICINE_FREQUENCY
+
+async def add_medicine_time_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор часа для времени приема."""
     query = update.callback_query
     await query.answer()
     
-    hour = query.data.replace("med_hour_", "")
-    context.user_data['medicine']['hour'] = hour
+    hour = query.data.replace("med_time_hour_", "")
+    context.user_data['medicine']['temp_hour'] = hour
     
     await query.edit_message_text(
-        f"Вы выбрали час {hour}. Выберите минуты:",
-        reply_markup=get_minute_keyboard(hour, "med", "med_hour_back"),
+        f"Вы выбрали час {hour}. Теперь выберите минуты:",
+        reply_markup=get_minute_keyboard(hour, "med_time", "med_time_back"),
         parse_mode=None
     )
-    return MEDICINE_TIME_MINUTE
+    return MEDICINE_TIME
 
-async def add_medicine_minute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор минуты."""
+async def add_medicine_time_minute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор минуты для времени приема."""
     query = update.callback_query
     await query.answer()
     
-    data = query.data.replace("med_minute_", "")
+    data = query.data.replace("med_time_minute_", "")
     hour, minute = data.split('_')
     time_str = f"{hour}:{minute}"
-    context.user_data['medicine']['time'] = time_str
+    
+    context.user_data['medicine']['times'].append(time_str)
+    
+    current = len(context.user_data['medicine']['times'])
+    total = context.user_data['medicine']['frequency']
+    
+    if current < total:
+        await query.edit_message_text(
+            f"Шаг 3/5: Выберите час для приема №{current+1} из {total}",
+            reply_markup=get_hour_keyboard("med_time", "start"),
+            parse_mode=None
+        )
+        return MEDICINE_TIME
+    else:
+        # Все времена выбраны
+        times_str = ", ".join(context.user_data['medicine']['times'])
+        
+        await query.edit_message_text(
+            f"Шаг 4/5: За сколько напомнить?\n\nВыбранное время: {times_str}",
+            reply_markup=get_reminder_keyboard("med", "start"),
+            parse_mode=None
+        )
+        return MEDICINE_REMINDER
+
+async def add_medicine_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор времени напоминания."""
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "med_remind_custom":
+            await query.edit_message_text(
+                "Введите количество минут (от 1 до 1440):",
+                parse_mode=None
+            )
+            return MEDICINE_REMINDER
+        
+        minutes = int(query.data.replace("med_remind_", ""))
+        context.user_data['medicine']['reminder_minutes'] = minutes
+    else:
+        try:
+            minutes = int(update.message.text.strip())
+            if minutes < 1 or minutes > 1440:
+                raise ValueError
+            context.user_data['medicine']['reminder_minutes'] = minutes
+        except:
+            await update.message.reply_text("❌ Введите число от 1 до 1440")
+            return MEDICINE_REMINDER
     
     med = context.user_data['medicine']
+    times_str = ", ".join(med['times'])
+    
     text = f"""✅ *Проверьте данные:*
 
 💊 Название: {med['name']}
-⏰ Время: {time_str}
+📊 Приемов в день: {med['frequency']}
+⏰ Время: {times_str}
+⏰ Напомнить за: {med['reminder_minutes']} мин.
 
 Всё верно?"""
     
     keyboard = [
         [
-            InlineKeyboardButton("✅ Добавить", callback_data="confirm_medicine"),
-            InlineKeyboardButton("✏️ Заново", callback_data="add_medicine"),
+            InlineKeyboardButton("✅ Записать", callback_data="confirm_medicine"),
+            InlineKeyboardButton("✏️ Редактировать", callback_data="add_medicine"),
         ],
         get_main_menu_button()
     ]
     
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=None
-    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=None
+        )
+    else:
+        await update.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=None
+        )
     return MEDICINE_CONFIRM
 
 async def add_medicine_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1416,10 +1539,14 @@ async def add_medicine_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     
     db = get_db()
     try:
+        times_str = ",".join(med['times'])
+        
         medicine = Medicine(
             user_id=user_id,
             name=med['name'],
-            schedule=med['time'],
+            frequency=med['frequency'],
+            times=times_str,
+            reminder_minutes=med['reminder_minutes'],
             start_date=datetime.now(pytz.UTC),
             user_timezone=tz,
             course_type='unlimited'
@@ -1427,31 +1554,56 @@ async def add_medicine_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         db.add(medicine)
         db.flush()
         
-        # Создаем напоминание
+        # Создаем напоминания на каждый прием
         now = datetime.now(pytz.timezone(tz))
-        h, m = map(int, med['time'].split(':'))
-        scheduled = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        if scheduled < now:
-            scheduled += timedelta(days=1)
         
-        reminder = Reminder(
-            user_id=user_id,
-            reminder_type='medicine',
-            item_id=medicine.id,
-            scheduled_time=scheduled.astimezone(pytz.UTC),
-            user_timezone=tz
-        )
-        db.add(reminder)
+        for time_str in med['times']:
+            h, m = map(int, time_str.split(':'))
+            scheduled = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if scheduled < now:
+                scheduled += timedelta(days=1)
+            
+            reminder = Reminder(
+                user_id=user_id,
+                reminder_type='medicine',
+                item_id=medicine.id,
+                scheduled_time=scheduled.astimezone(pytz.UTC),
+                user_timezone=tz
+            )
+            db.add(reminder)
+            db.flush()
+            
+            # Если указано напоминание заранее
+            if med['reminder_minutes'] and med['reminder_minutes'] > 0:
+                remind_time = scheduled - timedelta(minutes=med['reminder_minutes'])
+                if remind_time > datetime.now(pytz.UTC):
+                    reminder2 = Reminder(
+                        user_id=user_id,
+                        reminder_type='medicine',
+                        item_id=medicine.id,
+                        scheduled_time=remind_time.astimezone(pytz.UTC),
+                        user_timezone=tz
+                    )
+                    db.add(reminder2)
+                    db.flush()
+                    
+                    scheduler.scheduler.add_job(
+                        send_reminder_job,
+                        trigger=DateTrigger(run_date=remind_time.astimezone(pytz.UTC)),
+                        id=f"medicine_{reminder2.id}",
+                        args=[reminder2.id],
+                        replace_existing=True
+                    )
+            
+            scheduler.scheduler.add_job(
+                send_reminder_job,
+                trigger=DateTrigger(run_date=scheduled.astimezone(pytz.UTC)),
+                id=f"medicine_{reminder.id}",
+                args=[reminder.id],
+                replace_existing=True
+            )
+        
         db.commit()
-        
-        # Планируем задание
-        scheduler.scheduler.add_job(
-            send_reminder_job,
-            trigger=DateTrigger(run_date=scheduled.astimezone(pytz.UTC)),
-            id=f"medicine_{reminder.id}",
-            args=[reminder.id],
-            replace_existing=True
-        )
         
         keyboard = [
             [InlineKeyboardButton("📋 Список лекарств", callback_data="list_medicines")],
@@ -1460,7 +1612,7 @@ async def add_medicine_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         ]
         
         await query.edit_message_text(
-            f"✅ Лекарство '{med['name']}' добавлено!\nНапоминание в {med['time']}",
+            f"✅ Лекарство '{med['name']}' добавлено!\nНапоминания настроены.",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=None
         )
@@ -1489,18 +1641,20 @@ async def add_analysis_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     
     context.user_data.clear()
+    context.user_data['analysis'] = {}
+    
     await query.edit_message_text(
-        "🩺 *Добавление анализа/исследования*\n\nШаг 1/6: Введите название",
+        "🩺 *Добавление анализа/исследования*\n\nШаг 1/5: Введите название",
         parse_mode=None
     )
     return ANALYSIS_NAME
 
 async def add_analysis_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получение названия анализа."""
-    context.user_data['analysis'] = {'name': update.message.text}
+    context.user_data['analysis']['name'] = update.message.text
     
     await update.message.reply_text(
-        "Шаг 2/6: Выберите дату:",
+        "Шаг 2/5: Выберите дату:",
         reply_markup=get_simple_date_keyboard(),
         parse_mode=None
     )
@@ -1539,30 +1693,29 @@ async def add_analysis_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Неверный формат. Используйте ДД.ММ.ГГГГ")
             return ANALYSIS_DATE
     
-    # Переходим к выбору времени
     await (update.callback_query or update.message).reply_text(
-        "Шаг 3/6: Выберите час:",
+        "Шаг 3/5: Выберите час:",
         reply_markup=get_hour_keyboard("ana", "analysis_date_back"),
         parse_mode=None
     )
-    return ANALYSIS_TIME_HOUR
+    return ANALYSIS_TIME
 
-async def add_analysis_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_analysis_time_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выбор часа для анализа."""
     query = update.callback_query
     await query.answer()
     
     hour = query.data.replace("ana_hour_", "")
-    context.user_data['analysis']['hour'] = hour
+    context.user_data['analysis']['temp_hour'] = hour
     
     await query.edit_message_text(
         f"Вы выбрали час {hour}. Выберите минуты:",
         reply_markup=get_minute_keyboard(hour, "ana", "ana_hour_back"),
         parse_mode=None
     )
-    return ANALYSIS_TIME_MINUTE
+    return ANALYSIS_TIME
 
-async def add_analysis_minute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_analysis_time_minute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выбор минуты для анализа."""
     query = update.callback_query
     await query.answer()
@@ -1572,6 +1725,38 @@ async def add_analysis_minute(update: Update, context: ContextTypes.DEFAULT_TYPE
     time_str = f"{hour}:{minute}"
     context.user_data['analysis']['time'] = time_str
     
+    await query.edit_message_text(
+        "Шаг 4/5: За сколько напомнить?",
+        reply_markup=get_reminder_keyboard("ana", "analysis_time_back"),
+        parse_mode=None
+    )
+    return ANALYSIS_REMINDER
+
+async def add_analysis_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор времени напоминания."""
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "ana_remind_custom":
+            await query.edit_message_text(
+                "Введите количество минут (от 1 до 43200):",
+                parse_mode=None
+            )
+            return ANALYSIS_REMINDER
+        
+        minutes = int(query.data.replace("ana_remind_", ""))
+        context.user_data['analysis']['reminder_minutes'] = minutes
+    else:
+        try:
+            minutes = int(update.message.text.strip())
+            if minutes < 1 or minutes > 43200:
+                raise ValueError
+            context.user_data['analysis']['reminder_minutes'] = minutes
+        except:
+            await update.message.reply_text("❌ Введите число от 1 до 43200")
+            return ANALYSIS_REMINDER
+    
     ana = context.user_data['analysis']
     date = ana['date'].strftime('%d.%m.%Y')
     
@@ -1579,23 +1764,31 @@ async def add_analysis_minute(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 🩺 Название: {ana['name']}
 📅 Дата: {date}
-⏰ Время: {time_str}
+⏰ Время: {ana['time']}
+⏰ Напомнить за: {ana['reminder_minutes']} мин.
 
 Всё верно?"""
     
     keyboard = [
         [
-            InlineKeyboardButton("✅ Добавить", callback_data="confirm_analysis"),
-            InlineKeyboardButton("✏️ Заново", callback_data="add_analysis"),
+            InlineKeyboardButton("✅ Записать", callback_data="confirm_analysis"),
+            InlineKeyboardButton("✏️ Редактировать", callback_data="add_analysis"),
         ],
         get_main_menu_button()
     ]
     
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=None
-    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=None
+        )
+    else:
+        await update.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=None
+        )
     return ANALYSIS_CONFIRM
 
 async def add_analysis_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1617,14 +1810,14 @@ async def add_analysis_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
             name=ana['name'],
             scheduled_date=dt,
             scheduled_time=ana['time'],
-            reminder_before=120,  # 2 часа по умолчанию
+            reminder_minutes=ana['reminder_minutes'],
             user_timezone=tz
         )
         db.add(analysis)
         db.flush()
         
-        # Напоминание за 2 часа
-        remind_time = dt - timedelta(hours=2)
+        # Напоминание
+        remind_time = dt - timedelta(minutes=ana['reminder_minutes'])
         if remind_time > datetime.now(pytz.UTC):
             reminder = Reminder(
                 user_id=user_id,
@@ -1653,7 +1846,7 @@ async def add_analysis_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         ]
         
         await query.edit_message_text(
-            f"✅ Анализ '{ana['name']}' добавлен!",
+            f"✅ Анализ '{ana['name']}' добавлен!\nНапоминание настроено.",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=None
         )
@@ -1702,6 +1895,7 @@ async def extra_medicine_start(update: Update, context: ContextTypes.DEFAULT_TYP
             keyboard = []
             for m in medicines:
                 keyboard.append([InlineKeyboardButton(m.name, callback_data=f"extra_select_{m.id}")])
+            keyboard.append([InlineKeyboardButton("💊 Добавить лекарство", callback_data="add_medicine")])
             keyboard.append(get_main_menu_button())
         
         if query:
@@ -1970,7 +2164,6 @@ async def mood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         keyboard = [
             [InlineKeyboardButton("🩺 Отметить симптомы", callback_data="symptoms")],
-            [InlineKeyboardButton("📊 Детальная статистика", callback_data="stats_mood_detail")],
             get_main_menu_button()
         ]
         
@@ -2108,7 +2301,7 @@ async def symptom_severity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ Добавить еще", callback_data="symptoms")],
-                [InlineKeyboardButton("🗑️ Удалить симптомы", callback_data="manage_symptoms")],
+                [InlineKeyboardButton("🗑️ Управление симптомами", callback_data="manage_symptoms")],
                 get_main_menu_button()
             ])
         
@@ -2175,99 +2368,39 @@ async def postpone_analysis_start(update: Update, context: ContextTypes.DEFAULT_
     analysis_id = int(query.data.replace("postpone_analysis_", ""))
     context.user_data['postpone'] = {'analysis_id': analysis_id}
     
-    keyboard = [
-        [
-            InlineKeyboardButton("⏰ Часы", callback_data=f"postpone_analysis_hours_{analysis_id}"),
-            InlineKeyboardButton("📅 Дни", callback_data=f"postpone_analysis_days_{analysis_id}"),
-        ],
-        get_main_menu_button()
-    ]
-    
     await query.edit_message_text(
-        "⏸ В чем отложить анализ?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        "⏸ На сколько дней отложить анализ?",
+        reply_markup=get_postpone_keyboard("analysis", analysis_id),
         parse_mode=None
     )
-    return POSTPONE_ANALYSIS_HOURS
-
-async def postpone_analysis_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Откладывание на часы."""
-    query = update.callback_query
-    await query.answer()
-    
-    analysis_id = int(query.data.split('_')[-1])
-    context.user_data['postpone']['analysis_id'] = analysis_id
-    context.user_data['postpone']['type'] = 'hours'
-    
-    await query.edit_message_text(
-        "⏰ На сколько часов отложить?\n\nВыберите час:",
-        reply_markup=get_hour_keyboard("postpone_hours", "postpone_analysis_back"),
-        parse_mode=None
-    )
-    return POSTPONE_ANALYSIS_HOURS
-
-async def postpone_analysis_hours_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор часов."""
-    query = update.callback_query
-    await query.answer()
-    
-    hour = int(query.data.replace("postpone_hours_hour_", ""))
-    await process_analysis_postpone(query, context, hour, 'hours')
+    return POSTPONE_ANALYSIS
 
 async def postpone_analysis_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Откладывание на дни."""
-    query = update.callback_query
-    await query.answer()
-    
-    analysis_id = int(query.data.split('_')[-1])
-    context.user_data['postpone'] = {'analysis_id': analysis_id, 'type': 'days'}
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("5 дней", callback_data="postpone_days_5"),
-            InlineKeyboardButton("10 дней", callback_data="postpone_days_10"),
-        ],
-        [
-            InlineKeyboardButton("15 дней", callback_data="postpone_days_15"),
-            InlineKeyboardButton("30 дней", callback_data="postpone_days_30"),
-        ],
-        [InlineKeyboardButton("⚙️ Свой вариант", callback_data="postpone_days_custom")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="postpone_analysis_back")],
-        get_main_menu_button()
-    ]
-    
-    await query.edit_message_text(
-        "📅 На сколько дней отложить?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=None
-    )
-    return POSTPONE_ANALYSIS_DAYS
-
-async def postpone_analysis_days_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор дней."""
+    """Обработка выбора дней откладывания."""
     if update.callback_query:
         query = update.callback_query
         await query.answer()
         
-        if query.data == "postpone_days_custom":
+        if query.data == "postpone_analysis_custom":
             await query.edit_message_text("Введите количество дней (от 1 до 365):")
-            return POSTPONE_ANALYSIS_DAYS
+            return POSTPONE_ANALYSIS
         
-        days = int(query.data.replace("postpone_days_", ""))
-        await process_analysis_postpone(query, context, days, 'days')
+        parts = query.data.split('_')
+        days = int(parts[3])
+        await process_analysis_postpone(query, context, days)
     else:
         try:
             days = int(update.message.text.strip())
             if days < 1 or days > 365:
                 raise ValueError
-            await process_analysis_postpone(update.message, context, days, 'days')
+            await process_analysis_postpone(update.message, context, days)
         except:
             await update.message.reply_text("❌ Введите число от 1 до 365")
-            return POSTPONE_ANALYSIS_DAYS
+            return POSTPONE_ANALYSIS
     
     return ConversationHandler.END
 
-async def process_analysis_postpone(obj, context: ContextTypes.DEFAULT_TYPE, value: int, unit: str):
+async def process_analysis_postpone(obj, context: ContextTypes.DEFAULT_TYPE, days: int):
     """Обработка откладывания анализа."""
     analysis_id = context.user_data['postpone']['analysis_id']
     user_id = obj.from_user.id
@@ -2279,9 +2412,6 @@ async def process_analysis_postpone(obj, context: ContextTypes.DEFAULT_TYPE, val
             await obj.reply_text("❌ Анализ не найден")
             return
         
-        delta = timedelta(hours=value) if unit == 'hours' else timedelta(days=value)
-        unit_text = "часов" if unit == 'hours' else "дней"
-        
         reminder = db.query(Reminder).filter(
             Reminder.item_id == analysis_id,
             Reminder.reminder_type == 'analysis',
@@ -2290,19 +2420,20 @@ async def process_analysis_postpone(obj, context: ContextTypes.DEFAULT_TYPE, val
         
         if reminder:
             reminder.status = 'postponed'
-            reminder.postponed_until = datetime.now(pytz.UTC) + delta
+            reminder.postponed_until = datetime.now(pytz.UTC) + timedelta(days=days)
+            reminder.postponed_days = days
             
             log_entry = AnalysisLog(
                 analysis_id=analysis_id,
                 user_id=user_id,
                 status='postponed',
-                notes=f"Отложено на {value} {unit_text}"
+                notes=f"Отложено на {days} дн."
             )
             db.add(log_entry)
             db.commit()
             
             local_date = utc_to_local(reminder.postponed_until, get_user_timezone(user_id))
-            text = f"✅ Анализ {analysis.name} отложен на {value} {unit_text}.\nНапоминание возобновится {local_date.strftime('%d.%m.%Y %H:%M')}."
+            text = f"✅ Анализ {analysis.name} отложен на {days} дней.\nНапоминание возобновится {local_date.strftime('%d.%m.%Y')}."
             
             keyboard = [
                 [InlineKeyboardButton("📋 Список анализов", callback_data="list_analyses")],
@@ -2367,7 +2498,7 @@ async def analysis_notes_start(update: Update, context: ContextTypes.DEFAULT_TYP
         "📝 Введите заметки к анализу:",
         parse_mode=None
     )
-    return ANALYSIS_CONFIRM  # переиспользуем состояние
+    return ANALYSIS_CONFIRM
 
 async def analysis_notes_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохранение заметок к анализу."""
@@ -2667,7 +2798,8 @@ async def list_medicines(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pause = f" (пауза до {utc_to_local(m.paused_until, m.user_timezone).strftime('%d.%m')})"
                 else:
                     pause = ""
-                text += f"{i}. {m.name}{pause}\n   ⏰ {m.schedule}\n"
+                times_str = m.times.replace(",", ", ")
+                text += f"{i}. {m.name}{pause}\n   ⏰ {times_str} ({m.frequency} раз/день)\n"
                 keyboard.append([InlineKeyboardButton(f"🗑️ Удалить {m.name}", callback_data=f"delete_medicine_{m.id}")])
             keyboard.append([InlineKeyboardButton("💊 Добавить лекарство", callback_data="add_medicine")])
             keyboard.append(get_main_menu_button())
@@ -2710,6 +2842,7 @@ async def list_analyses(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 days = (date - now).days
                 status = "🔴 Просрочен" if days < 0 else "🟡 Сегодня" if days == 0 else f"🟢 Через {days} дн."
                 text += f"{i}. {a.name}\n   📅 {local.strftime('%d.%m.%Y')} в {a.scheduled_time} - {status}\n"
+                text += f"   ⏰ Напомнить за {a.reminder_minutes} мин.\n"
                 keyboard.append([InlineKeyboardButton(f"🗑️ Удалить {a.name}", callback_data=f"delete_analysis_{a.id}")])
             keyboard.append([InlineKeyboardButton("🩺 Добавить анализ", callback_data="add_analysis")])
             keyboard.append(get_main_menu_button())
@@ -2878,7 +3011,6 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             
             text = "🩺 *Детальная статистика симптомов:*\n\n"
-            keyboard = []
             for s in symptoms[:15]:
                 local = utc_to_local(s.created_at, tz)
                 text += f"{local.strftime('%d.%m %H:%M')}: {s.symptom} ({s.severity}/5)"
@@ -2886,8 +3018,10 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text += f" - {s.comment}"
                 text += "\n"
             
-            keyboard.append([InlineKeyboardButton("🗑️ Управление симптомами", callback_data="manage_symptoms")])
-            keyboard.append(get_main_menu_button())
+            keyboard = [
+                [InlineKeyboardButton("🗑️ Управление симптомами", callback_data="manage_symptoms")],
+                get_main_menu_button()
+            ]
             
             await query.edit_message_text(
                 text,
@@ -3318,16 +3452,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Откладывание анализов
     elif data.startswith("postpone_analysis_"):
-        if "hours" in data:
-            await postpone_analysis_hours(update, context)
-        elif "days" in data:
+        if "custom" in data:
+            await postpone_analysis_days(update, context)
+        elif data.count('_') == 3:
             await postpone_analysis_days(update, context)
         else:
             await postpone_analysis_start(update, context)
-    elif data.startswith("postpone_hours_hour_"):
-        await postpone_analysis_hours_select(update, context)
-    elif data.startswith("postpone_days_"):
-        await postpone_analysis_days_select(update, context)
     elif data.startswith("cancel_analysis_"):
         await cancel_analysis(update, context)
     elif data.startswith("analysis_notes_"):
@@ -3563,8 +3693,18 @@ def create_application():
         entry_points=[CallbackQueryHandler(add_medicine_start, pattern="^add_medicine$")],
         states={
             MEDICINE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_medicine_name)],
-            MEDICINE_TIME_HOUR: [CallbackQueryHandler(add_medicine_hour, pattern="^med_hour_")],
-            MEDICINE_TIME_MINUTE: [CallbackQueryHandler(add_medicine_minute, pattern="^med_minute_")],
+            MEDICINE_FREQUENCY: [
+                CallbackQueryHandler(add_medicine_frequency, pattern="^med_freq_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_medicine_frequency)
+            ],
+            MEDICINE_TIME: [
+                CallbackQueryHandler(add_medicine_time_hour, pattern="^med_time_hour_"),
+                CallbackQueryHandler(add_medicine_time_minute, pattern="^med_time_minute_"),
+            ],
+            MEDICINE_REMINDER: [
+                CallbackQueryHandler(add_medicine_reminder, pattern="^med_remind_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_medicine_reminder)
+            ],
             MEDICINE_CONFIRM: [CallbackQueryHandler(add_medicine_confirm, pattern="^confirm_medicine$")],
         },
         fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern="^cancel$")],
@@ -3580,8 +3720,14 @@ def create_application():
                 CallbackQueryHandler(add_analysis_date, pattern="^analysis_date_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_analysis_date)
             ],
-            ANALYSIS_TIME_HOUR: [CallbackQueryHandler(add_analysis_hour, pattern="^ana_hour_")],
-            ANALYSIS_TIME_MINUTE: [CallbackQueryHandler(add_analysis_minute, pattern="^ana_minute_")],
+            ANALYSIS_TIME: [
+                CallbackQueryHandler(add_analysis_time_hour, pattern="^ana_hour_"),
+                CallbackQueryHandler(add_analysis_time_minute, pattern="^ana_minute_"),
+            ],
+            ANALYSIS_REMINDER: [
+                CallbackQueryHandler(add_analysis_reminder, pattern="^ana_remind_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_analysis_reminder)
+            ],
             ANALYSIS_CONFIRM: [CallbackQueryHandler(add_analysis_confirm, pattern="^confirm_analysis$")],
         },
         fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern="^cancel$")],
@@ -3640,14 +3786,9 @@ def create_application():
     postpone_analysis_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(postpone_analysis_start, pattern="^postpone_analysis_")],
         states={
-            POSTPONE_ANALYSIS_HOURS: [
-                CallbackQueryHandler(postpone_analysis_hours, pattern="^postpone_analysis_hours_"),
-                CallbackQueryHandler(postpone_analysis_hours_select, pattern="^postpone_hours_hour_"),
-                CallbackQueryHandler(postpone_analysis_days, pattern="^postpone_analysis_days_"),
-            ],
-            POSTPONE_ANALYSIS_DAYS: [
-                CallbackQueryHandler(postpone_analysis_days_select, pattern="^postpone_days_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, postpone_analysis_days_select)
+            POSTPONE_ANALYSIS: [
+                CallbackQueryHandler(postpone_analysis_days, pattern="^postpone_analysis_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, postpone_analysis_days)
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern="^cancel$")],
@@ -3685,7 +3826,7 @@ async def main():
         return
     
     print("🚀 Запуск ЛОР-Помощника...")
-    print(f"📊 Версия: 10.0.0 (Ultimate)")
+    print(f"📊 Версия: 11.0.0 (Новая логика)")
     print(f"📁 Данные: {DATA_DIR}")
     print(f"📁 Бэкапы: {BACKUP_DIR}")
     print(f"📁 Логи: {LOG_DIR}")
