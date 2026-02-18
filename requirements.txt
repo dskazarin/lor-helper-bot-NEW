@@ -4,5 +4,4 @@ sqlalchemy==2.0.23
 pytz==2023.3
 nest_asyncio==1.6.0
 requests==2.31.0
-uvloop==0.19.0  # для Linux (опционально)
-python-dotenv==1.0.0  # для загрузки .env
+python-dotenv==1.0.0
