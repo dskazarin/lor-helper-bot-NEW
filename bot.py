@@ -30,6 +30,32 @@ import pytz
 import sqlite3
 from dataclasses import dataclass, asdict
 
+# ============== ЗАЩИТА ОТ МНОЖЕСТВЕННЫХ ЗАПУСКОВ ==============
+import socket
+import fcntl
+import struct
+
+def check_single_instance():
+    """Проверяет, что запущен только один экземпляр бота."""
+    lock_file = '/tmp/bot_single_instance.lock'
+    
+    try:
+        # Пытаемся создать lock-файл
+        fp = open(lock_file, 'w')
+        fcntl.flock(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        
+        # Записываем PID процесса
+        fp.write(str(os.getpid()))
+        fp.flush()
+        
+        return True
+    except (IOError, OSError):
+        print("❌ Бот уже запущен! Завершаю работу.")
+        sys.exit(1)
+
+# Вызываем проверку сразу
+check_single_instance()
+
 # ============== ОТКЛЮЧЕНИЕ ПРЕДУПРЕЖДЕНИЙ ==============
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 warnings.filterwarnings('ignore', category=UserWarning)
