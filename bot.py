@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ЛОР-Помощник - Telegram бот для управления приемом лекарств и отслеживания симптомов
-Версия: 11.0.0 (Новая логика добавления)
+Версия: 11.0.0 (Стабильная с автоматической миграцией)
 Автор: Денис Казарин (врач-оториноларинголог)
 """
 
@@ -96,7 +96,8 @@ except ImportError:
 try:
     from sqlalchemy import (
         create_engine, Column, Integer, String, DateTime, Text, 
-        Boolean, BigInteger, Index, func, select, and_, or_, desc
+        Boolean, BigInteger, Index, func, select, and_, or_, desc,
+        inspect
     )
     from sqlalchemy.ext.declarative import declarative_base
     from sqlalchemy.orm import sessionmaker, scoped_session
@@ -106,16 +107,17 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install sqlalchemy==2.0.23")
     from sqlalchemy import (
         create_engine, Column, Integer, String, DateTime, Text, 
-        Boolean, BigInteger, Index, func, select, and_, or_, desc
+        Boolean, BigInteger, Index, func, select, and_, or_, desc,
+        inspect
     )
     from sqlalchemy.ext.declarative import declarative_base
     from sqlalchemy.orm import sessionmaker, scoped_session
     from sqlalchemy.pool import QueuePool
 
 # ============== КОНФИГУРАЦИЯ ==============
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВАШ_ТОКЕН_ЗДЕСЬ")
-ADMIN_IDS = [int(id) for id in os.environ.get("ADMIN_IDS", "").split(",") if id]
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8515765315:AAEufR-gJQUZCux_kC0yDfmHRZf2QLgacUk")
+ADMIN_IDS = [int(id) for id in os.environ.get("ADMIN_IDS", "308780639").split(",") if id]
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "308780639")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 # Директории для данных
@@ -123,14 +125,19 @@ DATA_DIR = Path("/app/data")
 BACKUP_DIR = Path("/app/backups")
 LOG_DIR = Path("/app/logs")
 
+# Создаем директории
 for directory in [DATA_DIR, BACKUP_DIR, LOG_DIR]:
     os.makedirs(directory, exist_ok=True)
+    print(f"📁 Создана директория: {directory}")
 
 # Пути к базам данных
 DB_PATH = DATA_DIR / "lor_reminder.db"
 JOBS_DB_PATH = DATA_DIR / "apscheduler_jobs.db"
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 JOB_STORE_URL = f"sqlite:///{JOBS_DB_PATH}"
+
+print(f"📁 База данных: {DB_PATH}")
+print(f"📁 БД планировщика: {JOBS_DB_PATH}")
 
 # Контакты клиник
 KIT_CLINIC = {
@@ -598,9 +605,7 @@ class Medicine(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(BigInteger, nullable=False, index=True)
     name = Column(String(200), nullable=False)
-    frequency = Column(Integer, nullable=False, default=1)  # количество раз в день
-    times = Column(String(200), nullable=False)  # "08:00,20:00" или "08:00"
-    reminder_minutes = Column(Integer, nullable=True)  # за сколько минут напомнить
+    schedule = Column(String(200), nullable=False)  # время в формате "08:00" или "08:00,20:00"
     start_date = Column(DateTime, nullable=True)
     end_date = Column(DateTime, nullable=True)
     user_timezone = Column(String(50), nullable=False)
@@ -623,9 +628,9 @@ class Analysis(Base):
     name = Column(String(200), nullable=False)
     scheduled_date = Column(DateTime, nullable=False)
     scheduled_time = Column(String(10), nullable=False, default='12:00')
-    reminder_minutes = Column(Integer, default=120)  # за сколько минут напомнить
     repeat_type = Column(String(20), default='once')
     repeat_interval = Column(Integer, nullable=True)
+    reminder_before = Column(Integer, default=120)  # в минутах
     notes = Column(Text, nullable=True)
     status = Column(String(20), default='pending')
     user_timezone = Column(String(50), nullable=False)
@@ -722,11 +727,137 @@ class BroadcastLog(Base):
     id = Column(Integer, primary_key=True)
     admin_id = Column(BigInteger, nullable=False)
     message = Column(Text, nullable=False)
-    target = Column(String(50), nullable=False)  # 'all', 'active'
+    target = Column(String(50), nullable=False)
     total = Column(Integer, nullable=False)
     success = Column(Integer, nullable=False)
     failed = Column(Integer, nullable=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(pytz.UTC))
+
+# ============== ФУНКЦИЯ МИГРАЦИИ БАЗЫ ДАННЫХ ==============
+
+def migrate_database():
+    """Автоматическое добавление недостающих колонок."""
+    db = SessionLocal()
+    try:
+        inspector = inspect(engine)
+        
+        # Миграция таблицы medicines
+        if 'medicines' in inspector.get_table_names():
+            columns = [c['name'] for c in inspector.get_columns('medicines')]
+            
+            # Проверяем и добавляем все необходимые колонки
+            if 'course_type' not in columns:
+                db.execute(text('ALTER TABLE medicines ADD COLUMN course_type VARCHAR(20) DEFAULT "unlimited"'))
+                log.info("✅ Добавлена колонка course_type в medicines")
+            
+            if 'course_days' not in columns:
+                db.execute(text('ALTER TABLE medicines ADD COLUMN course_days INTEGER'))
+                log.info("✅ Добавлена колонка course_days в medicines")
+            
+            if 'repeat_type' not in columns:
+                db.execute(text('ALTER TABLE medicines ADD COLUMN repeat_type VARCHAR(20) DEFAULT "none"'))
+                log.info("✅ Добавлена колонка repeat_type в medicines")
+            
+            if 'repeat_days' not in columns:
+                db.execute(text('ALTER TABLE medicines ADD COLUMN repeat_days INTEGER'))
+                log.info("✅ Добавлена колонка repeat_days в medicines")
+            
+            if 'paused_until' not in columns:
+                db.execute(text('ALTER TABLE medicines ADD COLUMN paused_until DATETIME'))
+                log.info("✅ Добавлена колонка paused_until в medicines")
+            
+            if 'end_date' not in columns:
+                db.execute(text('ALTER TABLE medicines ADD COLUMN end_date DATETIME'))
+                log.info("✅ Добавлена колонка end_date в medicines")
+        
+        # Миграция таблицы analyses
+        if 'analyses' in inspector.get_table_names():
+            columns = [c['name'] for c in inspector.get_columns('analyses')]
+            
+            if 'repeat_interval' not in columns:
+                db.execute(text('ALTER TABLE analyses ADD COLUMN repeat_interval INTEGER'))
+                log.info("✅ Добавлена колонка repeat_interval в analyses")
+            
+            if 'reminder_before' not in columns:
+                db.execute(text('ALTER TABLE analyses ADD COLUMN reminder_before INTEGER DEFAULT 120'))
+                log.info("✅ Добавлена колонка reminder_before в analyses")
+            
+            if 'scheduled_time' not in columns:
+                db.execute(text('ALTER TABLE analyses ADD COLUMN scheduled_time VARCHAR(10) DEFAULT "12:00"'))
+                log.info("✅ Добавлена колонка scheduled_time в analyses")
+            
+            if 'paused_until' not in columns:
+                db.execute(text('ALTER TABLE analyses ADD COLUMN paused_until DATETIME'))
+                log.info("✅ Добавлена колонка paused_until в analyses")
+            
+            if 'notes' not in columns:
+                db.execute(text('ALTER TABLE analyses ADD COLUMN notes TEXT'))
+                log.info("✅ Добавлена колонка notes в analyses")
+        
+        # Миграция таблицы reminders
+        if 'reminders' in inspector.get_table_names():
+            columns = [c['name'] for c in inspector.get_columns('reminders')]
+            
+            if 'postponed_days' not in columns:
+                db.execute(text('ALTER TABLE reminders ADD COLUMN postponed_days INTEGER'))
+                log.info("✅ Добавлена колонка postponed_days в reminders")
+            
+            if 'postponed_until' not in columns:
+                db.execute(text('ALTER TABLE reminders ADD COLUMN postponed_until DATETIME'))
+                log.info("✅ Добавлена колонка postponed_until в reminders")
+            
+            if 'retry_count' not in columns:
+                db.execute(text('ALTER TABLE reminders ADD COLUMN retry_count INTEGER DEFAULT 0'))
+                log.info("✅ Добавлена колонка retry_count в reminders")
+            
+            if 'last_error' not in columns:
+                db.execute(text('ALTER TABLE reminders ADD COLUMN last_error TEXT'))
+                log.info("✅ Добавлена колонка last_error в reminders")
+        
+        # Миграция таблицы medicine_logs
+        if 'medicine_logs' in inspector.get_table_names():
+            columns = [c['name'] for c in inspector.get_columns('medicine_logs')]
+            
+            if 'is_planned' not in columns:
+                db.execute(text('ALTER TABLE medicine_logs ADD COLUMN is_planned BOOLEAN DEFAULT 1'))
+                log.info("✅ Добавлена колонка is_planned в medicine_logs")
+            
+            if 'dosage' not in columns:
+                db.execute(text('ALTER TABLE medicine_logs ADD COLUMN dosage VARCHAR(50)'))
+                log.info("✅ Добавлена колонка dosage в medicine_logs")
+            
+            if 'comment' not in columns:
+                db.execute(text('ALTER TABLE medicine_logs ADD COLUMN comment TEXT'))
+                log.info("✅ Добавлена колонка comment в medicine_logs")
+            
+            if 'course_info' not in columns:
+                db.execute(text('ALTER TABLE medicine_logs ADD COLUMN course_info TEXT'))
+                log.info("✅ Добавлена колонка course_info в medicine_logs")
+        
+        # Миграция таблицы users
+        if 'users' in inspector.get_table_names():
+            columns = [c['name'] for c in inspector.get_columns('users')]
+            
+            if 'is_admin' not in columns:
+                db.execute(text('ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT 0'))
+                log.info("✅ Добавлена колонка is_admin в users")
+            
+            if 'language' not in columns:
+                db.execute(text('ALTER TABLE users ADD COLUMN language VARCHAR(10) DEFAULT "ru"'))
+                log.info("✅ Добавлена колонка language в users")
+            
+            if 'total_interactions' not in columns:
+                db.execute(text('ALTER TABLE users ADD COLUMN total_interactions INTEGER DEFAULT 0'))
+                log.info("✅ Добавлена колонка total_interactions в users")
+        
+        db.commit()
+        log.info("✅ Миграция базы данных завершена успешно")
+        
+    except Exception as e:
+        log.error(f"❌ Ошибка при миграции БД: {e}")
+        db.rollback()
+    finally:
+        db.close()
 
 # ============== СОЕДИНЕНИЕ С БД ==============
 
@@ -741,53 +872,12 @@ SessionLocal = sessionmaker(bind=engine)
 
 def init_db():
     """Инициализация базы данных."""
+    # Создаем таблицы
     Base.metadata.create_all(bind=engine)
+    log.info("✅ Таблицы созданы/проверены")
     
-    db = SessionLocal()
-    try:
-        from sqlalchemy import inspect
-        inspector = inspect(engine)
-        
-        tables = inspector.get_table_names()
-        
-        if 'medicines' in tables:
-            med_columns = [c['name'] for c in inspector.get_columns('medicines')]
-            if 'frequency' not in med_columns:
-                db.execute(text('ALTER TABLE medicines ADD COLUMN frequency INTEGER DEFAULT 1'))
-                db.commit()
-            if 'reminder_minutes' not in med_columns:
-                db.execute(text('ALTER TABLE medicines ADD COLUMN reminder_minutes INTEGER'))
-                db.commit()
-            if 'paused_until' not in med_columns:
-                db.execute(text('ALTER TABLE medicines ADD COLUMN paused_until DATETIME'))
-                db.commit()
-        
-        if 'analyses' in tables:
-            ana_columns = [c['name'] for c in inspector.get_columns('analyses')]
-            if 'paused_until' not in ana_columns:
-                db.execute(text('ALTER TABLE analyses ADD COLUMN paused_until DATETIME'))
-                db.commit()
-            if 'reminder_minutes' not in ana_columns:
-                db.execute(text('ALTER TABLE analyses ADD COLUMN reminder_minutes INTEGER DEFAULT 120'))
-                db.commit()
-        
-        if 'reminders' in tables:
-            rem_columns = [c['name'] for c in inspector.get_columns('reminders')]
-            if 'postponed_days' not in rem_columns:
-                db.execute(text('ALTER TABLE reminders ADD COLUMN postponed_days INTEGER'))
-                db.commit()
-        
-        if 'medicine_logs' in tables:
-            log_columns = [c['name'] for c in inspector.get_columns('medicine_logs')]
-            if 'is_planned' not in log_columns:
-                db.execute(text('ALTER TABLE medicine_logs ADD COLUMN is_planned BOOLEAN DEFAULT 1'))
-                db.commit()
-            
-    except Exception as e:
-        log.error(f"Ошибка инициализации БД: {e}")
-        db.rollback()
-    finally:
-        db.close()
+    # Запускаем миграцию
+    migrate_database()
 
 init_db()
 
@@ -950,7 +1040,7 @@ def check_existing_analysis(user_id: int, date: datetime, time: str) -> bool:
     finally:
         db.close()
 
-# ============== ФУНКЦИИ ДЛЯ КНОПОК НАВИГАЦИИ ==============
+# ============== КЛАВИАТУРЫ ==============
 
 def get_main_menu_button():
     return [InlineKeyboardButton("🏠 Главная", callback_data="start")]
@@ -990,65 +1080,6 @@ def get_about_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def get_medicine_inline_keyboard(medicine_id: int):
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Принял(а)", callback_data=f"take_{medicine_id}"),
-            InlineKeyboardButton("📝 Комментарий", callback_data=f"comment_{medicine_id}"),
-        ],
-        [
-            InlineKeyboardButton("⏸ Отложить", callback_data=f"postpone_medicine_{medicine_id}"),
-            InlineKeyboardButton("⏸ Пауза курса", callback_data=f"pause_medicine_{medicine_id}"),
-        ],
-        [
-            InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_{medicine_id}"),
-            InlineKeyboardButton("🗑️ Отменить", callback_data=f"cancel_medicine_{medicine_id}"),
-        ],
-        get_main_menu_button()
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def get_analysis_inline_keyboard(analysis_id: int):
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Сдал(а)", callback_data=f"analysis_take_{analysis_id}"),
-            InlineKeyboardButton("📝 Заметки", callback_data=f"analysis_notes_{analysis_id}"),
-        ],
-        [
-            InlineKeyboardButton("⏸ Отложить", callback_data=f"postpone_analysis_{analysis_id}"),
-            InlineKeyboardButton("🗑️ Отменить", callback_data=f"cancel_analysis_{analysis_id}"),
-        ],
-        get_main_menu_button()
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def get_mood_keyboard():
-    keyboard = [
-        [
-            InlineKeyboardButton("1 😢", callback_data="mood_1"),
-            InlineKeyboardButton("2 🙁", callback_data="mood_2"),
-            InlineKeyboardButton("3 😐", callback_data="mood_3"),
-            InlineKeyboardButton("4 🙂", callback_data="mood_4"),
-            InlineKeyboardButton("5 😊", callback_data="mood_5"),
-        ],
-        get_main_menu_button()
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def get_frequency_keyboard(prefix: str):
-    """Клавиатура для выбора количества раз в день."""
-    keyboard = [
-        [
-            InlineKeyboardButton("1 раз", callback_data=f"{prefix}_freq_1"),
-            InlineKeyboardButton("2 раза", callback_data=f"{prefix}_freq_2"),
-            InlineKeyboardButton("3 раза", callback_data=f"{prefix}_freq_3"),
-        ],
-        [InlineKeyboardButton("⚙️ Свой вариант", callback_data=f"{prefix}_freq_custom")],
-        [InlineKeyboardButton("🔙 Отмена", callback_data="start")],
-        get_main_menu_button()
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
 def get_hour_keyboard(prefix: str, back_callback: str):
     """Клавиатура для выбора часа."""
     keyboard = []
@@ -1067,7 +1098,7 @@ def get_hour_keyboard(prefix: str, back_callback: str):
     
     return InlineKeyboardMarkup(keyboard)
 
-def get_minute_keyboard(hour: str, prefix: str, back_callback: str):
+def get_minute_keyboard(prefix: str, hour: str, back_callback: str):
     """Клавиатура для выбора минуты."""
     keyboard = []
     minutes = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]
@@ -1080,34 +1111,9 @@ def get_minute_keyboard(hour: str, prefix: str, back_callback: str):
     if row:
         keyboard.append(row)
     
-    keyboard.append([
-        InlineKeyboardButton("🔙 К выбору часа", callback_data=back_callback),
-        get_main_menu_button()[0]
-    ])
+    keyboard.append([InlineKeyboardButton("🔙 К выбору часа", callback_data=back_callback)])
+    keyboard.append(get_main_menu_button())
     
-    return InlineKeyboardMarkup(keyboard)
-
-def get_reminder_keyboard(prefix: str, back_callback: str):
-    """Клавиатура для выбора времени напоминания."""
-    keyboard = [
-        [
-            InlineKeyboardButton("⏰ 15 мин", callback_data=f"{prefix}_remind_15"),
-            InlineKeyboardButton("⏰ 30 мин", callback_data=f"{prefix}_remind_30"),
-            InlineKeyboardButton("⏰ 1 час", callback_data=f"{prefix}_remind_60"),
-        ],
-        [
-            InlineKeyboardButton("⏰ 2 часа", callback_data=f"{prefix}_remind_120"),
-            InlineKeyboardButton("⏰ 3 часа", callback_data=f"{prefix}_remind_180"),
-            InlineKeyboardButton("⏰ 6 часов", callback_data=f"{prefix}_remind_360"),
-        ],
-        [
-            InlineKeyboardButton("⏰ 12 часов", callback_data=f"{prefix}_remind_720"),
-            InlineKeyboardButton("⏰ 24 часа", callback_data=f"{prefix}_remind_1440"),
-            InlineKeyboardButton("⚙️ Свое", callback_data=f"{prefix}_remind_custom"),
-        ],
-        [InlineKeyboardButton("🔙 Назад", callback_data=back_callback)],
-        get_main_menu_button()
-    ]
     return InlineKeyboardMarkup(keyboard)
 
 def get_simple_date_keyboard():
@@ -1116,9 +1122,9 @@ def get_simple_date_keyboard():
     keyboard = []
     
     for i in range(3):
-        d = today + timedelta(days=i)
-        date_str = d.strftime('%d.%m.%Y')
-        day_name = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][d.weekday()]
+        date = today + timedelta(days=i)
+        date_str = date.strftime('%d.%m.%Y')
+        day_name = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][date.weekday()]
         keyboard.append([InlineKeyboardButton(
             f"{date_str} ({day_name})", 
             callback_data=f"analysis_date_{date_str}"
@@ -1130,62 +1136,86 @@ def get_simple_date_keyboard():
     
     return InlineKeyboardMarkup(keyboard)
 
-def get_symptom_list_keyboard(user_id: int, page: int = 0):
-    """Клавиатура со списком симптомов для удаления."""
-    db = get_db()
-    try:
-        symptoms = db.query(SymptomLog).filter(
-            SymptomLog.user_id == user_id
-        ).order_by(SymptomLog.created_at.desc()).limit(10).offset(page * 10).all()
-        
-        if not symptoms:
-            return None
-        
-        keyboard = []
-        for s in symptoms:
-            local_time = utc_to_local(s.created_at, get_user_timezone(user_id))
-            date_str = local_time.strftime('%d.%m %H:%M')
-            text = f"{s.symptom} ({s.severity}/5) - {date_str}"
-            keyboard.append([InlineKeyboardButton(
-                f"❌ {text[:30]}...",
-                callback_data=f"delete_symptom_{s.id}"
-            )])
-        
-        nav = []
-        if page > 0:
-            nav.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"symptom_page_{page-1}"))
-        if len(symptoms) == 10:
-            nav.append(InlineKeyboardButton("➡️ Вперед", callback_data=f"symptom_page_{page+1}"))
-        if nav:
-            keyboard.append(nav)
-        
-        keyboard.append(get_main_menu_button())
-        return InlineKeyboardMarkup(keyboard)
-    finally:
-        db.close()
-
-def get_postpone_keyboard(item_type: str, item_id: int):
-    """Клавиатура для выбора срока откладывания."""
+def get_medicine_inline_keyboard(medicine_id: int):
     keyboard = [
         [
-            InlineKeyboardButton("5 дней", callback_data=f"postpone_{item_type}_{item_id}_5"),
-            InlineKeyboardButton("10 дней", callback_data=f"postpone_{item_type}_{item_id}_10"),
+            InlineKeyboardButton("✅ Принял(а)", callback_data=f"take_{medicine_id}"),
+            InlineKeyboardButton("📝 Комментарий", callback_data=f"comment_{medicine_id}"),
         ],
         [
-            InlineKeyboardButton("15 дней", callback_data=f"postpone_{item_type}_{item_id}_15"),
-            InlineKeyboardButton("30 дней", callback_data=f"postpone_{item_type}_{item_id}_30"),
+            InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_{medicine_id}"),
+            InlineKeyboardButton("🗑️ Удалить", callback_data=f"delete_medicine_{medicine_id}"),
         ],
-        [
-            InlineKeyboardButton("⚙️ Свой вариант", callback_data=f"postpone_{item_type}_{item_id}_custom"),
-        ],
-        [
-            InlineKeyboardButton("🔙 Назад", callback_data=f"back_to_{item_type}_{item_id}"),
-            get_main_menu_button()[0]
-        ]
+        get_main_menu_button()
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# ============== АДМИН-КЛАВИАТУРЫ ==============
+def get_analysis_inline_keyboard(analysis_id: int):
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Сдал(а)", callback_data=f"analysis_take_{analysis_id}"),
+            InlineKeyboardButton("📝 Заметки", callback_data=f"analysis_notes_{analysis_id}"),
+        ],
+        [
+            InlineKeyboardButton("❌ Пропустить", callback_data=f"analysis_skip_{analysis_id}"),
+            InlineKeyboardButton("🗑️ Удалить", callback_data=f"delete_analysis_{analysis_id}"),
+        ],
+        get_main_menu_button()
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_mood_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("1 😢", callback_data="mood_1"),
+            InlineKeyboardButton("2 🙁", callback_data="mood_2"),
+            InlineKeyboardButton("3 😐", callback_data="mood_3"),
+            InlineKeyboardButton("4 🙂", callback_data="mood_4"),
+            InlineKeyboardButton("5 😊", callback_data="mood_5"),
+        ],
+        get_main_menu_button()
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_timezone_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("Москва (UTC+3)", callback_data="tz_Europe/Moscow"),
+            InlineKeyboardButton("СПб (UTC+3)", callback_data="tz_Europe/Moscow"),
+        ],
+        [
+            InlineKeyboardButton("Калининград (UTC+2)", callback_data="tz_Europe/Kaliningrad"),
+            InlineKeyboardButton("Самара (UTC+4)", callback_data="tz_Europe/Samara"),
+        ],
+        [
+            InlineKeyboardButton("Екатеринбург (UTC+5)", callback_data="tz_Asia/Yekaterinburg"),
+            InlineKeyboardButton("Омск (UTC+6)", callback_data="tz_Asia/Omsk"),
+        ],
+        [
+            InlineKeyboardButton("Красноярск (UTC+7)", callback_data="tz_Asia/Krasnoyarsk"),
+            InlineKeyboardButton("Иркутск (UTC+8)", callback_data="tz_Asia/Irkutsk"),
+        ],
+        [get_main_menu_button()[0]]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_stats_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 За неделю", callback_data="stats_week"),
+            InlineKeyboardButton("📊 За месяц", callback_data="stats_month"),
+        ],
+        [
+            InlineKeyboardButton("📊 За все время", callback_data="stats_all"),
+            InlineKeyboardButton("📊 Настроение", callback_data="stats_mood"),
+        ],
+        [
+            InlineKeyboardButton("📊 Симптомы", callback_data="stats_symptoms"),
+            InlineKeyboardButton("💊 Лекарства", callback_data="stats_medicine"),
+        ],
+        get_main_menu_button()
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 def get_admin_panel_keyboard():
     keyboard = [
@@ -1203,7 +1233,6 @@ def get_admin_panel_keyboard():
 def get_admin_users_keyboard():
     keyboard = [
         [InlineKeyboardButton("📋 Список пользователей", callback_data="admin_users_list")],
-        [InlineKeyboardButton("🔍 Поиск по ID", callback_data="admin_users_search")],
         [InlineKeyboardButton("🚫 Заблокированные", callback_data="admin_users_banned")],
         [InlineKeyboardButton("👑 Администраторы", callback_data="admin_users_admins")],
         [InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")],
@@ -1215,8 +1244,6 @@ def get_admin_logs_keyboard():
     keyboard = [
         [InlineKeyboardButton("📋 Последние ошибки", callback_data="admin_logs_errors")],
         [InlineKeyboardButton("📊 Статистика за день", callback_data="admin_logs_today")],
-        [InlineKeyboardButton("👥 Действия пользователей", callback_data="admin_logs_users")],
-        [InlineKeyboardButton("⏱ Медленные запросы", callback_data="admin_logs_slow")],
         [InlineKeyboardButton("📁 Скачать файлы логов", callback_data="admin_logs_files")],
         [InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")],
         get_main_menu_button()
@@ -1227,24 +1254,29 @@ def get_admin_backups_keyboard():
     keyboard = [
         [InlineKeyboardButton("🔄 Создать бэкап", callback_data="admin_backup_create")],
         [InlineKeyboardButton("📋 Список бэкапов", callback_data="admin_backup_list")],
-        [InlineKeyboardButton("⚙️ Настройки бэкапов", callback_data="admin_backup_settings")],
         [InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")],
         get_main_menu_button()
     ]
     return InlineKeyboardMarkup(keyboard)
 
 # ============== СОСТОЯНИЯ CONVERSATION HANDLER ==============
+
 (
-    MEDICINE_NAME, MEDICINE_FREQUENCY, MEDICINE_TIME, MEDICINE_REMINDER, MEDICINE_CONFIRM,
-    ANALYSIS_NAME, ANALYSIS_DATE, ANALYSIS_TIME, ANALYSIS_REMINDER, ANALYSIS_CONFIRM,
-    SYMPTOM_TEXT, SYMPTOM_SEVERITY,
-    MEDICINE_COMMENT, MEDICINE_DOSAGE, MEDICINE_EXTRA_REASON,
-    POSTPONE_MEDICINE, POSTPONE_ANALYSIS,
-    PAUSE_MEDICINE, PAUSE_ANALYSIS,
+    MEDICINE_NAME, 
+    MEDICINE_TIME_HOUR, 
+    MEDICINE_TIME_MINUTE,
+    MEDICINE_CONFIRM,
+    ANALYSIS_NAME, 
+    ANALYSIS_DATE,
+    ANALYSIS_TIME_HOUR, 
+    ANALYSIS_TIME_MINUTE,
+    ANALYSIS_CONFIRM,
+    SYMPTOM_TEXT, 
+    SYMPTOM_SEVERITY,
     EXTRA_MEDICINE_SELECT,
-    ADMIN_BROADCAST_MESSAGE, ADMIN_BROADCAST_CONFIRM,
-    ADMIN_USER_SEARCH
-) = range(23)
+    ADMIN_BROADCAST_MESSAGE,
+    ADMIN_BROADCAST_CONFIRM
+) = range(14)
 
 # ============== ОБРАБОТЧИКИ КОМАНД ==============
 
@@ -1264,12 +1296,6 @@ async def register_user(update: Update) -> bool:
             db.add(new_user)
             db.commit()
             log.info(f"🎉 Новый пользователь: {user.first_name} (@{user.username})", update=update)
-            
-            if error_notifier:
-                error_notifier.notify(
-                    "NEW_USER",
-                    f"Новый пользователь: {user.first_name} (ID: {user.id})"
-                )
             return True
         else:
             existing.last_activity = datetime.now(pytz.UTC)
@@ -1283,32 +1309,19 @@ async def register_user(update: Update) -> bool:
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start."""
-    is_new = await register_user(update)
+    await register_user(update)
     
-    if is_new:
-        text = f"""👋 Здравствуйте, {update.effective_user.first_name}!
+    text = f"""👋 Здравствуйте, {update.effective_user.first_name}!
 
-Я ЛОР-Помощник — персональный медицинский бот, созданный врачом-оториноларингологом Денисом Казариным.
+Я ЛОР-Помощник — персональный медицинский бот.
 
 👶 Врач ведет прием детей с 0 лет и взрослых
 
-📖 Быстрый старт:
-1️⃣ Добавьте лекарство - нажмите кнопку "💊 Добавить лекарство"
-2️⃣ Укажите сколько раз в день
-3️⃣ Выберите время приема
-4️⃣ Укажите за сколько напомнить
-
-🩺 Для анализов - аналогично
-
-📊 Отслеживайте самочувствие - кнопка "📊 Самочувствие"
-
-❓ Если что-то непонятно - зайдите в раздел "👨‍⚕️ О враче" и нажмите "❓ Помощь"
-
-Выберите действие в меню ниже:"""
-    else:
-        text = f"""👋 С возвращением, {update.effective_user.first_name}!
-
-Чем могу помочь сегодня?
+📖 *Возможности:*
+• 💊 Напоминания о лекарствах
+• 🩺 Напоминания об анализах
+• 📊 Отслеживание самочувствия
+• 📈 Статистика
 
 Выберите действие в меню ниже:"""
     
@@ -1317,19 +1330,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help."""
-    text = """❓ Как очистить историю переписки
+    text = """❓ *Помощь*
 
-Чтобы удалить всю переписку с ботом и вернуться на главную:
+• /start - Главное меню
+• /admin - Панель администратора (только для админов)
 
-1️⃣ В правом верхнем углу нажмите на свой профиль
-2️⃣ В меню выберите пункт "Еще" (или "More")
-3️⃣ Прокрутите вниз и нажмите "Удалить переписку" (или "Delete chat")
-
-✅ После этого откроется начальная страница бота
-💾 Все ваши сохраненные данные останутся без изменений
-
-👇 Нажмите синюю кнопку START внизу чтобы вернуться к боту"""
-
+Чтобы очистить историю: нажмите на профиль → Еще → Удалить переписку"""
+    
     if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=get_about_keyboard(), parse_mode=None)
     else:
@@ -1354,7 +1361,185 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=get_about_keyboard(), parse_mode=None)
     log.info("✅ /about обработан", update=update)
 
-# ============== ДОБАВЛЕНИЕ ЛЕКАРСТВА ==============
+# ============== АДМИН-КОМАНДЫ ==============
+
+@admin_only
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Панель администратора."""
+    await update.message.reply_text(
+        "🔐 *Панель администратора*\n\nВыберите раздел:",
+        reply_markup=get_admin_panel_keyboard(),
+        parse_mode=None
+    )
+    log.info(f"🔐 Админ-панель открыта", update=update)
+
+@admin_only
+async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика бота."""
+    query = update.callback_query
+    await query.answer()
+    
+    db = get_db()
+    try:
+        total_users = db.query(User).count()
+        active_today = db.query(User).filter(
+            User.last_activity >= datetime.now(pytz.UTC) - timedelta(days=1)
+        ).count()
+        total_medicines = db.query(Medicine).filter(Medicine.status == 'active').count()
+        total_analyses = db.query(Analysis).filter(Analysis.status == 'pending').count()
+        
+        text = f"""📊 *Статистика бота*
+
+👥 *Пользователи:* {total_users}
+📊 *Активных сегодня:* {active_today}
+💊 *Активных лекарств:* {total_medicines}
+🩺 *Запланированных анализов:* {total_analyses}"""
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")]]),
+            parse_mode=None
+        )
+    finally:
+        db.close()
+
+@admin_only
+async def admin_users_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Управление пользователями."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "👥 *Управление пользователями*\n\nВыберите действие:",
+        reply_markup=get_admin_users_keyboard(),
+        parse_mode=None
+    )
+
+@admin_only
+async def admin_users_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список пользователей."""
+    query = update.callback_query
+    await query.answer()
+    
+    db = get_db()
+    try:
+        users = db.query(User).order_by(User.registered_at.desc()).limit(10).all()
+        
+        text = "📋 *Последние 10 пользователей:*\n\n"
+        for u in users:
+            date = u.registered_at.strftime('%d.%m.%Y')
+            name = u.first_name or u.username or str(u.user_id)
+            text += f"• {name} (ID: {u.user_id}) - {date}\n"
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_users")]]),
+            parse_mode=None
+        )
+    finally:
+        db.close()
+
+@admin_only
+async def admin_logs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр логов."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "📈 *Просмотр логов*\n\nВыберите действие:",
+        reply_markup=get_admin_logs_keyboard(),
+        parse_mode=None
+    )
+
+@admin_only
+async def admin_logs_errors_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Последние ошибки."""
+    query = update.callback_query
+    await query.answer()
+    
+    error_log = LOG_DIR / "error.log"
+    if not error_log.exists():
+        await query.edit_message_text("📭 Файл с ошибками пока пуст")
+        return
+    
+    with open(error_log, 'r', encoding='utf-8') as f:
+        lines = f.readlines()[-10:]
+    
+    if not lines:
+        await query.edit_message_text("✅ Ошибок не обнаружено!")
+        return
+    
+    text = "🚨 *Последние ошибки:*\n\n"
+    for line in lines:
+        if len(line) > 150:
+            line = line[:150] + "..."
+        text += f"`{line.strip()}`\n"
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_logs")]]),
+        parse_mode=None
+    )
+
+@admin_only
+async def admin_backups_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Управление бэкапами."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "📁 *Управление бэкапами*\n\nВыберите действие:",
+        reply_markup=get_admin_backups_keyboard(),
+        parse_mode=None
+    )
+
+@admin_only
+async def admin_backup_create_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Создание бэкапа."""
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text("🔄 Создаю резервную копию...")
+    backup_path = backup_manager.create_backup("manual")
+    
+    if backup_path:
+        await query.edit_message_text(
+            f"✅ Бэкап успешно создан!",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_backups")]]),
+            parse_mode=None
+        )
+    else:
+        await query.edit_message_text("❌ Ошибка при создании бэкапа")
+
+@admin_only
+async def admin_backup_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список бэкапов."""
+    query = update.callback_query
+    await query.answer()
+    
+    backups = backup_manager.get_backups()
+    
+    if not backups:
+        await query.edit_message_text("📭 Нет сохраненных бэкапов")
+        return
+    
+    text = "📋 *Доступные бэкапы:*\n\n"
+    for backup in backups[:5]:
+        try:
+            date = datetime.strptime(backup['timestamp'], '%Y%m%d_%H%M%S')
+            date_str = date.strftime('%d.%m.%Y %H:%M')
+        except:
+            date_str = backup['timestamp']
+        
+        emoji = {'auto': '🤖', 'manual': '👤'}.get(backup['type'], '📦')
+        text += f"{emoji} {date_str} - {backup['size_kb']:.0f} KB\n"
+    
+    text += f"\nВсего: {len(backups)} бэкапов"
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_backups")]]),
+        parse_mode=None
+    )
+
+# ============== ОБРАБОТЧИКИ ДОБАВЛЕНИЯ ЛЕКАРСТВ ==============
 
 async def add_medicine_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начало добавления лекарства."""
@@ -1362,266 +1547,140 @@ async def add_medicine_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     
     context.user_data.clear()
-    context.user_data['medicine'] = {}
-    
     await query.edit_message_text(
-        "💊 *Добавление лекарства*\n\nШаг 1/5: Введите название лекарства",
+        "💊 *Добавление лекарства*\n\nШаг 1/4: Введите название лекарства",
         parse_mode=None
     )
     return MEDICINE_NAME
 
 async def add_medicine_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение названия лекарства."""
-    context.user_data['medicine']['name'] = update.message.text
+    """Получение названия."""
+    context.user_data['medicine'] = {'name': update.message.text}
     
     await update.message.reply_text(
-        "Шаг 2/5: Сколько раз в день принимать?",
-        reply_markup=get_frequency_keyboard("med"),
+        "Шаг 2/4: Выберите час приема:",
+        reply_markup=get_hour_keyboard("med", "start"),
         parse_mode=None
     )
-    return MEDICINE_FREQUENCY
+    return MEDICINE_TIME_HOUR
 
-async def add_medicine_frequency(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор количества приемов в день."""
-    if update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        
-        if query.data == "med_freq_custom":
-            await query.edit_message_text(
-                "Введите количество раз в день (от 1 до 10):",
-                parse_mode=None
-            )
-            return MEDICINE_FREQUENCY
-        
-        freq = int(query.data.replace("med_freq_", ""))
-        context.user_data['medicine']['frequency'] = freq
-        context.user_data['medicine']['times'] = []
-        
-        await query.edit_message_text(
-            f"Шаг 3/5: Выберите час для приема №1 из {freq}",
-            reply_markup=get_hour_keyboard("med_time", "start"),
-            parse_mode=None
-        )
-        return MEDICINE_TIME
-    else:
-        try:
-            freq = int(update.message.text.strip())
-            if freq < 1 or freq > 10:
-                raise ValueError
-            context.user_data['medicine']['frequency'] = freq
-            context.user_data['medicine']['times'] = []
-            
-            await update.message.reply_text(
-                f"Шаг 3/5: Выберите час для приема №1 из {freq}",
-                reply_markup=get_hour_keyboard("med_time", "start"),
-                parse_mode=None
-            )
-            return MEDICINE_TIME
-        except:
-            await update.message.reply_text("❌ Введите число от 1 до 10")
-            return MEDICINE_FREQUENCY
-
-async def add_medicine_time_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор часа для времени приема."""
+async def add_medicine_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор часа."""
     query = update.callback_query
     await query.answer()
     
-    hour = query.data.replace("med_time_hour_", "")
-    context.user_data['medicine']['temp_hour'] = hour
+    hour = query.data.replace("med_hour_", "")
+    context.user_data['medicine']['hour'] = hour
     
     await query.edit_message_text(
-        f"Вы выбрали час {hour}. Теперь выберите минуты:",
-        reply_markup=get_minute_keyboard(hour, "med_time", "med_time_back"),
+        f"Вы выбрали час {hour}. Выберите минуты:",
+        reply_markup=get_minute_keyboard("med", hour, "med_hour_back"),
         parse_mode=None
     )
-    return MEDICINE_TIME
+    return MEDICINE_TIME_MINUTE
 
-async def add_medicine_time_minute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор минуты для времени приема."""
+async def add_medicine_minute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор минуты."""
     query = update.callback_query
     await query.answer()
     
-    data = query.data.replace("med_time_minute_", "")
+    data = query.data.replace("med_minute_", "")
     hour, minute = data.split('_')
     time_str = f"{hour}:{minute}"
-    
-    context.user_data['medicine']['times'].append(time_str)
-    
-    current = len(context.user_data['medicine']['times'])
-    total = context.user_data['medicine']['frequency']
-    
-    if current < total:
-        await query.edit_message_text(
-            f"Шаг 3/5: Выберите час для приема №{current+1} из {total}",
-            reply_markup=get_hour_keyboard("med_time", "start"),
-            parse_mode=None
-        )
-        return MEDICINE_TIME
-    else:
-        # Все времена выбраны
-        times_str = ", ".join(context.user_data['medicine']['times'])
-        
-        await query.edit_message_text(
-            f"Шаг 4/5: За сколько напомнить?\n\nВыбранное время: {times_str}",
-            reply_markup=get_reminder_keyboard("med", "start"),
-            parse_mode=None
-        )
-        return MEDICINE_REMINDER
-
-async def add_medicine_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор времени напоминания."""
-    if update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        
-        if query.data == "med_remind_custom":
-            await query.edit_message_text(
-                "Введите количество минут (от 1 до 1440):",
-                parse_mode=None
-            )
-            return MEDICINE_REMINDER
-        
-        minutes = int(query.data.replace("med_remind_", ""))
-        context.user_data['medicine']['reminder_minutes'] = minutes
-    else:
-        try:
-            minutes = int(update.message.text.strip())
-            if minutes < 1 or minutes > 1440:
-                raise ValueError
-            context.user_data['medicine']['reminder_minutes'] = minutes
-        except:
-            await update.message.reply_text("❌ Введите число от 1 до 1440")
-            return MEDICINE_REMINDER
+    context.user_data['medicine']['time'] = time_str
     
     med = context.user_data['medicine']
-    times_str = ", ".join(med['times'])
-    
     text = f"""✅ *Проверьте данные:*
 
 💊 Название: {med['name']}
-📊 Приемов в день: {med['frequency']}
-⏰ Время: {times_str}
-⏰ Напомнить за: {med['reminder_minutes']} мин.
+⏰ Время: {time_str}
 
 Всё верно?"""
     
     keyboard = [
         [
-            InlineKeyboardButton("✅ Записать", callback_data="confirm_medicine"),
-            InlineKeyboardButton("✏️ Редактировать", callback_data="add_medicine"),
+            InlineKeyboardButton("✅ Добавить", callback_data="confirm_medicine"),
+            InlineKeyboardButton("✏️ Заново", callback_data="add_medicine"),
         ],
         get_main_menu_button()
     ]
     
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=None
-        )
-    else:
-        await update.message.reply_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=None
-        )
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=None
+    )
     return MEDICINE_CONFIRM
 
 async def add_medicine_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подтверждение добавления лекарства."""
+    """Подтверждение добавления."""
     query = update.callback_query
     await query.answer()
     
     user_id = update.effective_user.id
-    med = context.user_data['medicine']
-    tz = get_user_timezone(user_id)
+    med = context.user_data.get('medicine', {})
+    
+    if not med or 'name' not in med or 'time' not in med:
+        await query.edit_message_text(
+            "❌ Ошибка данных. Попробуйте снова.",
+            reply_markup=InlineKeyboardMarkup([get_main_menu_button()]),
+            parse_mode=None
+        )
+        return ConversationHandler.END
     
     db = get_db()
     try:
-        times_str = ",".join(med['times'])
-        
+        # Сохраняем лекарство
         medicine = Medicine(
             user_id=user_id,
             name=med['name'],
-            frequency=med['frequency'],
-            times=times_str,
-            reminder_minutes=med['reminder_minutes'],
+            schedule=med['time'],
             start_date=datetime.now(pytz.UTC),
-            user_timezone=tz,
+            user_timezone=get_user_timezone(user_id),
             course_type='unlimited'
         )
         db.add(medicine)
         db.flush()
         
-        # Создаем напоминания на каждый прием
-        now = datetime.now(pytz.timezone(tz))
+        # Создаем напоминание на сегодня
+        tz = pytz.timezone(get_user_timezone(user_id))
+        now = datetime.now(tz)
+        h, m = map(int, med['time'].split(':'))
+        scheduled = now.replace(hour=h, minute=m, second=0, microsecond=0)
         
-        for time_str in med['times']:
-            h, m = map(int, time_str.split(':'))
-            scheduled = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            if scheduled < now:
-                scheduled += timedelta(days=1)
-            
-            reminder = Reminder(
-                user_id=user_id,
-                reminder_type='medicine',
-                item_id=medicine.id,
-                scheduled_time=scheduled.astimezone(pytz.UTC),
-                user_timezone=tz
-            )
-            db.add(reminder)
-            db.flush()
-            
-            # Если указано напоминание заранее
-            if med['reminder_minutes'] and med['reminder_minutes'] > 0:
-                remind_time = scheduled - timedelta(minutes=med['reminder_minutes'])
-                if remind_time > datetime.now(pytz.UTC):
-                    reminder2 = Reminder(
-                        user_id=user_id,
-                        reminder_type='medicine',
-                        item_id=medicine.id,
-                        scheduled_time=remind_time.astimezone(pytz.UTC),
-                        user_timezone=tz
-                    )
-                    db.add(reminder2)
-                    db.flush()
-                    
-                    scheduler.scheduler.add_job(
-                        send_reminder_job,
-                        trigger=DateTrigger(run_date=remind_time.astimezone(pytz.UTC)),
-                        id=f"medicine_{reminder2.id}",
-                        args=[reminder2.id],
-                        replace_existing=True
-                    )
-            
-            scheduler.scheduler.add_job(
-                send_reminder_job,
-                trigger=DateTrigger(run_date=scheduled.astimezone(pytz.UTC)),
-                id=f"medicine_{reminder.id}",
-                args=[reminder.id],
-                replace_existing=True
-            )
+        # Если время уже прошло, переносим на завтра
+        if scheduled < now:
+            scheduled += timedelta(days=1)
         
+        reminder = Reminder(
+            user_id=user_id,
+            reminder_type='medicine',
+            item_id=medicine.id,
+            scheduled_time=scheduled.astimezone(pytz.UTC),
+            user_timezone=get_user_timezone(user_id)
+        )
+        db.add(reminder)
         db.commit()
         
-        keyboard = [
-            [InlineKeyboardButton("📋 Список лекарств", callback_data="list_medicines")],
-            [InlineKeyboardButton("➕ Добавить еще", callback_data="add_medicine")],
-            get_main_menu_button()
-        ]
-        
-        await query.edit_message_text(
-            f"✅ Лекарство '{med['name']}' добавлено!\nНапоминания настроены.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=None
+        # Планируем задание
+        scheduler.scheduler.add_job(
+            send_reminder_job,
+            trigger=DateTrigger(run_date=scheduled.astimezone(pytz.UTC)),
+            id=f"medicine_{reminder.id}",
+            args=[reminder.id],
+            replace_existing=True
         )
         
+        await query.edit_message_text(
+            f"✅ Лекарство '{med['name']}' добавлено!\nНапоминание в {med['time']}",
+            reply_markup=InlineKeyboardMarkup([get_main_menu_button()]),
+            parse_mode=None
+        )
         log.info(f"✅ Лекарство добавлено: {med['name']}", update=update)
         
     except Exception as e:
         db.rollback()
-        log.error(f"Ошибка добавления лекарства: {e}", update=update, exc_info=True)
+        log.error(f"❌ Ошибка добавления лекарства: {e}", update=update, exc_info=True)
         await query.edit_message_text(
             "❌ Ошибка при добавлении лекарства",
             reply_markup=InlineKeyboardMarkup([get_main_menu_button()]),
@@ -1633,7 +1692,7 @@ async def add_medicine_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     
     return ConversationHandler.END
 
-# ============== ДОБАВЛЕНИЕ АНАЛИЗА ==============
+# ============== ОБРАБОТЧИКИ ДОБАВЛЕНИЯ АНАЛИЗОВ ==============
 
 async def add_analysis_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начало добавления анализа."""
@@ -1641,27 +1700,25 @@ async def add_analysis_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     
     context.user_data.clear()
-    context.user_data['analysis'] = {}
-    
     await query.edit_message_text(
-        "🩺 *Добавление анализа/исследования*\n\nШаг 1/5: Введите название",
+        "🩺 *Добавление анализа/исследования*\n\nШаг 1/4: Введите название",
         parse_mode=None
     )
     return ANALYSIS_NAME
 
 async def add_analysis_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение названия анализа."""
-    context.user_data['analysis']['name'] = update.message.text
+    """Получение названия."""
+    context.user_data['analysis'] = {'name': update.message.text}
     
     await update.message.reply_text(
-        "Шаг 2/5: Выберите дату:",
+        "Шаг 2/4: Выберите дату:",
         reply_markup=get_simple_date_keyboard(),
         parse_mode=None
     )
     return ANALYSIS_DATE
 
 async def add_analysis_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор даты анализа."""
+    """Выбор даты."""
     user_id = update.effective_user.id
     tz = get_user_timezone(user_id)
     
@@ -1676,6 +1733,9 @@ async def add_analysis_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ANALYSIS_DATE
         
+        if query.data == "analysis_date_back":
+            return await add_analysis_start(update, context)
+        
         date_str = query.data.replace("analysis_date_", "")
         try:
             date = datetime.strptime(date_str, '%d.%m.%Y')
@@ -1685,38 +1745,44 @@ async def add_analysis_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Неверный формат даты")
             return ANALYSIS_DATE
     else:
-        try:
-            date = datetime.strptime(update.message.text.strip(), '%d.%m.%Y')
-            date = pytz.timezone(tz).localize(date.replace(hour=12))
-            context.user_data['analysis']['date'] = date
-        except:
-            await update.message.reply_text("❌ Неверный формат. Используйте ДД.ММ.ГГГГ")
+        date = parse_date(update.message.text.strip(), tz)
+        if not date:
+            await update.message.reply_text("❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ")
             return ANALYSIS_DATE
+        context.user_data['analysis']['date'] = date
     
-    await (update.callback_query or update.message).reply_text(
-        "Шаг 3/5: Выберите час:",
-        reply_markup=get_hour_keyboard("ana", "analysis_date_back"),
-        parse_mode=None
-    )
-    return ANALYSIS_TIME
+    # Переходим к выбору времени
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            "Шаг 3/4: Выберите час:",
+            reply_markup=get_hour_keyboard("ana", "analysis_date_back"),
+            parse_mode=None
+        )
+    else:
+        await update.message.reply_text(
+            "Шаг 3/4: Выберите час:",
+            reply_markup=get_hour_keyboard("ana", "analysis_date_back"),
+            parse_mode=None
+        )
+    return ANALYSIS_TIME_HOUR
 
-async def add_analysis_time_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор часа для анализа."""
+async def add_analysis_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор часа."""
     query = update.callback_query
     await query.answer()
     
     hour = query.data.replace("ana_hour_", "")
-    context.user_data['analysis']['temp_hour'] = hour
+    context.user_data['analysis']['hour'] = hour
     
     await query.edit_message_text(
         f"Вы выбрали час {hour}. Выберите минуты:",
-        reply_markup=get_minute_keyboard(hour, "ana", "ana_hour_back"),
+        reply_markup=get_minute_keyboard("ana", hour, "ana_hour_back"),
         parse_mode=None
     )
-    return ANALYSIS_TIME
+    return ANALYSIS_TIME_MINUTE
 
-async def add_analysis_time_minute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор минуты для анализа."""
+async def add_analysis_minute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор минуты."""
     query = update.callback_query
     await query.answer()
     
@@ -1725,80 +1791,47 @@ async def add_analysis_time_minute(update: Update, context: ContextTypes.DEFAULT
     time_str = f"{hour}:{minute}"
     context.user_data['analysis']['time'] = time_str
     
-    await query.edit_message_text(
-        "Шаг 4/5: За сколько напомнить?",
-        reply_markup=get_reminder_keyboard("ana", "analysis_time_back"),
-        parse_mode=None
-    )
-    return ANALYSIS_REMINDER
-
-async def add_analysis_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор времени напоминания."""
-    if update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        
-        if query.data == "ana_remind_custom":
-            await query.edit_message_text(
-                "Введите количество минут (от 1 до 43200):",
-                parse_mode=None
-            )
-            return ANALYSIS_REMINDER
-        
-        minutes = int(query.data.replace("ana_remind_", ""))
-        context.user_data['analysis']['reminder_minutes'] = minutes
-    else:
-        try:
-            minutes = int(update.message.text.strip())
-            if minutes < 1 or minutes > 43200:
-                raise ValueError
-            context.user_data['analysis']['reminder_minutes'] = minutes
-        except:
-            await update.message.reply_text("❌ Введите число от 1 до 43200")
-            return ANALYSIS_REMINDER
-    
     ana = context.user_data['analysis']
-    date = ana['date'].strftime('%d.%m.%Y')
+    date_str = ana['date'].strftime('%d.%m.%Y')
     
     text = f"""✅ *Проверьте данные:*
 
 🩺 Название: {ana['name']}
-📅 Дата: {date}
-⏰ Время: {ana['time']}
-⏰ Напомнить за: {ana['reminder_minutes']} мин.
+📅 Дата: {date_str}
+⏰ Время: {time_str}
 
 Всё верно?"""
     
     keyboard = [
         [
-            InlineKeyboardButton("✅ Записать", callback_data="confirm_analysis"),
-            InlineKeyboardButton("✏️ Редактировать", callback_data="add_analysis"),
+            InlineKeyboardButton("✅ Добавить", callback_data="confirm_analysis"),
+            InlineKeyboardButton("✏️ Заново", callback_data="add_analysis"),
         ],
         get_main_menu_button()
     ]
     
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=None
-        )
-    else:
-        await update.message.reply_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=None
-        )
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=None
+    )
     return ANALYSIS_CONFIRM
 
 async def add_analysis_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подтверждение добавления анализа."""
+    """Подтверждение добавления."""
     query = update.callback_query
     await query.answer()
     
     user_id = update.effective_user.id
-    ana = context.user_data['analysis']
-    tz = get_user_timezone(user_id)
+    ana = context.user_data.get('analysis', {})
+    
+    if not ana or 'name' not in ana or 'date' not in ana or 'time' not in ana:
+        await query.edit_message_text(
+            "❌ Ошибка данных. Попробуйте снова.",
+            reply_markup=InlineKeyboardMarkup([get_main_menu_button()]),
+            parse_mode=None
+        )
+        return ConversationHandler.END
     
     db = get_db()
     try:
@@ -1810,21 +1843,20 @@ async def add_analysis_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
             name=ana['name'],
             scheduled_date=dt,
             scheduled_time=ana['time'],
-            reminder_minutes=ana['reminder_minutes'],
-            user_timezone=tz
+            user_timezone=get_user_timezone(user_id)
         )
         db.add(analysis)
         db.flush()
         
-        # Напоминание
-        remind_time = dt - timedelta(minutes=ana['reminder_minutes'])
+        # Напоминание за 2 часа
+        remind_time = dt - timedelta(hours=2)
         if remind_time > datetime.now(pytz.UTC):
             reminder = Reminder(
                 user_id=user_id,
                 reminder_type='analysis',
                 item_id=analysis.id,
                 scheduled_time=remind_time,
-                user_timezone=tz
+                user_timezone=get_user_timezone(user_id)
             )
             db.add(reminder)
             db.flush()
@@ -1839,23 +1871,16 @@ async def add_analysis_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         
         db.commit()
         
-        keyboard = [
-            [InlineKeyboardButton("📋 Список анализов", callback_data="list_analyses")],
-            [InlineKeyboardButton("➕ Добавить еще", callback_data="add_analysis")],
-            get_main_menu_button()
-        ]
-        
         await query.edit_message_text(
-            f"✅ Анализ '{ana['name']}' добавлен!\nНапоминание настроено.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            f"✅ Анализ '{ana['name']}' добавлен!",
+            reply_markup=InlineKeyboardMarkup([get_main_menu_button()]),
             parse_mode=None
         )
-        
         log.info(f"✅ Анализ добавлен: {ana['name']}", update=update)
         
     except Exception as e:
         db.rollback()
-        log.error(f"Ошибка добавления анализа: {e}", update=update, exc_info=True)
+        log.error(f"❌ Ошибка добавления анализа: {e}", update=update, exc_info=True)
         await query.edit_message_text(
             "❌ Ошибка при добавлении анализа",
             reply_markup=InlineKeyboardMarkup([get_main_menu_button()]),
@@ -1867,255 +1892,139 @@ async def add_analysis_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     
     return ConversationHandler.END
 
-# ============== ЭКСТРЕННЫЙ ПРИЕМ ==============
+# ============== ОБРАБОТЧИКИ СПИСКОВ ==============
 
-async def extra_medicine_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало экстренного приема."""
+async def list_medicines(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список лекарств."""
+    user_id = update.effective_user.id
+    
     query = update.callback_query
     if query:
         await query.answer()
-    
-    user_id = update.effective_user.id
     
     db = get_db()
     try:
         medicines = db.query(Medicine).filter(
             Medicine.user_id == user_id,
             Medicine.status == 'active'
-        ).all()
+        ).order_by(Medicine.created_at.desc()).all()
         
         if not medicines:
-            text = "💊 У вас нет активных лекарств. Сначала добавьте лекарство."
+            text = "📋 У вас нет активных лекарств"
             keyboard = [
                 [InlineKeyboardButton("💊 Добавить лекарство", callback_data="add_medicine")],
                 get_main_menu_button()
             ]
         else:
-            text = "💊 Выберите лекарство, которое приняли:"
+            text = "📋 Ваши лекарства:\n\n"
             keyboard = []
-            for m in medicines:
-                keyboard.append([InlineKeyboardButton(m.name, callback_data=f"extra_select_{m.id}")])
+            for i, m in enumerate(medicines, 1):
+                text += f"{i}. {m.name}\n   ⏰ {m.schedule}\n"
+                keyboard.append([InlineKeyboardButton(f"🗑️ Удалить {m.name}", callback_data=f"delete_medicine_{m.id}")])
             keyboard.append([InlineKeyboardButton("💊 Добавить лекарство", callback_data="add_medicine")])
             keyboard.append(get_main_menu_button())
         
         if query:
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
-            return EXTRA_MEDICINE_SELECT
         else:
             await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
-            return EXTRA_MEDICINE_SELECT
     finally:
         db.close()
 
-async def extra_medicine_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор лекарства для экстренного приема."""
-    query = update.callback_query
-    await query.answer()
-    
-    med_id = int(query.data.replace("extra_select_", ""))
-    context.user_data['extra'] = {'medicine_id': med_id}
-    
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⏭️ Пропустить", callback_data="skip_dosage")]])
-    
-    await query.edit_message_text(
-        "💊 Укажите принятую дозу (например: 1 таблетка):",
-        reply_markup=keyboard,
-        parse_mode=None
-    )
-    return MEDICINE_DOSAGE
-
-async def extra_medicine_dosage(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сохранение дозы."""
-    if update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        context.user_data['extra']['dosage'] = None
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⏭️ Пропустить", callback_data="skip_comment")]])
-        await query.edit_message_text(
-            "📝 Добавьте комментарий:",
-            reply_markup=keyboard,
-            parse_mode=None
-        )
-    else:
-        if update.message.text == "/skip":
-            context.user_data['extra']['dosage'] = None
-        else:
-            context.user_data['extra']['dosage'] = update.message.text
-        
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⏭️ Пропустить", callback_data="skip_comment")]])
-        await update.message.reply_text(
-            "📝 Добавьте комментарий:",
-            reply_markup=keyboard,
-            parse_mode=None
-        )
-    return MEDICINE_COMMENT
-
-async def extra_medicine_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сохранение комментария и завершение."""
-    if update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        if query.data == "skip_comment":
-            comment = None
-        else:
-            comment = None
-    else:
-        if update.message.text == "/skip":
-            comment = None
-        else:
-            comment = update.message.text
-    
+async def list_analyses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список анализов."""
     user_id = update.effective_user.id
-    med_id = context.user_data['extra']['medicine_id']
-    dosage = context.user_data['extra'].get('dosage')
+    
+    query = update.callback_query
+    if query:
+        await query.answer()
     
     db = get_db()
     try:
-        medicine = db.query(Medicine).filter_by(id=med_id).first()
-        if not medicine:
-            await (update.callback_query or update.message).reply_text("❌ Лекарство не найдено")
-            return ConversationHandler.END
+        analyses = db.query(Analysis).filter(
+            Analysis.user_id == user_id,
+            Analysis.status == 'pending'
+        ).order_by(Analysis.scheduled_date.asc()).all()
         
-        log_entry = MedicineLog(
-            medicine_id=med_id,
-            user_id=user_id,
-            status='extra',
-            dosage=dosage,
-            comment=comment,
-            is_planned=False,
-            course_info=f"{medicine.course_type} ({medicine.course_days or '∞'} дн.)"
-        )
-        db.add(log_entry)
-        db.commit()
-        
-        text = f"✅ Прием {medicine.name} зафиксирован!"
-        if dosage:
-            text += f"\n💊 Доза: {dosage}"
-        if comment:
-            text += f"\n📝 Комментарий: {comment}"
-        
-        keyboard = [
-            [InlineKeyboardButton("👨‍⚕️ Записаться к врачу", callback_data="about")],
-            get_main_menu_button()
-        ]
-        
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=None
-            )
+        if not analyses:
+            text = "📋 У вас нет запланированных анализов"
+            keyboard = [
+                [InlineKeyboardButton("🩺 Добавить анализ", callback_data="add_analysis")],
+                get_main_menu_button()
+            ]
         else:
-            await update.message.reply_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=None
-            )
+            text = "📋 Запланированные анализы:\n\n"
+            keyboard = []
+            now = datetime.now(pytz.UTC)
+            for i, a in enumerate(analyses, 1):
+                local = utc_to_local(a.scheduled_date, a.user_timezone)
+                text += f"{i}. {a.name}\n   📅 {local.strftime('%d.%m.%Y %H:%M')}\n"
+                keyboard.append([InlineKeyboardButton(f"🗑️ Удалить {a.name}", callback_data=f"delete_analysis_{a.id}")])
+            keyboard.append([InlineKeyboardButton("🩺 Добавить анализ", callback_data="add_analysis")])
+            keyboard.append(get_main_menu_button())
         
-    except Exception as e:
-        log.error(f"Ошибка экстренного приема: {e}", update=update, exc_info=True)
-        await (update.callback_query or update.message).reply_text("❌ Ошибка")
+        if query:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
+        else:
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
     finally:
         db.close()
-        context.user_data.clear()
-    
-    return ConversationHandler.END
 
-# ============== КОММЕНТАРИИ К ЛЕКАРСТВАМ ==============
-
-async def medicine_comment_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало комментария."""
+async def delete_medicine(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаление лекарства."""
     query = update.callback_query
     await query.answer()
     
-    med_id = int(query.data.replace("comment_", ""))
-    context.user_data['comment'] = {'medicine_id': med_id}
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🤒 Новый симптом", callback_data=f"comment_symptom_{med_id}")],
-        [InlineKeyboardButton("⚠️ Побочное действие", callback_data=f"comment_side_{med_id}")],
-        [InlineKeyboardButton("📝 Обычный комментарий", callback_data=f"comment_normal_{med_id}")],
-        get_main_menu_button()
-    ])
-    
-    await query.edit_message_text(
-        "📝 Выберите тип комментария:",
-        reply_markup=keyboard,
-        parse_mode=None
-    )
-    return MEDICINE_COMMENT
-
-async def medicine_comment_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор типа комментария."""
-    query = update.callback_query
-    await query.answer()
-    
-    parts = query.data.split('_')
-    med_id = int(parts[2])
-    ctype = parts[1]
-    
-    context.user_data['comment'] = {
-        'medicine_id': med_id,
-        'type': ctype
-    }
-    
-    await query.edit_message_text(
-        "📝 Введите текст комментария:",
-        parse_mode=None
-    )
-    return MEDICINE_COMMENT
-
-async def medicine_comment_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сохранение комментария."""
-    comment = update.message.text
-    user_id = update.effective_user.id
-    data = context.user_data.get('comment', {})
-    med_id = data.get('medicine_id')
-    
-    if not med_id:
-        await update.message.reply_text("❌ Ошибка. Начните заново.")
-        return ConversationHandler.END
+    med_id = int(query.data.replace("delete_medicine_", ""))
     
     db = get_db()
     try:
-        last = db.query(MedicineLog).filter(
-            MedicineLog.medicine_id == med_id,
-            MedicineLog.user_id == user_id
-        ).order_by(MedicineLog.taken_at.desc()).first()
-        
-        if last:
-            last.comment = comment
+        med = db.query(Medicine).filter_by(id=med_id).first()
+        if med:
+            med.status = 'deleted'
+            for r in db.query(Reminder).filter(
+                Reminder.item_id == med_id,
+                Reminder.reminder_type == 'medicine',
+                Reminder.status.in_(['pending', 'sent'])
+            ):
+                r.status = 'cancelled'
+                try:
+                    scheduler.scheduler.remove_job(f"medicine_{r.id}")
+                except:
+                    pass
             db.commit()
-        
-        # Если это новый симптом, переходим к добавлению симптома
-        if data.get('type') == 'symptom':
-            context.user_data['symptom_from_medicine'] = {
-                'comment': comment,
-                'medicine_id': med_id
-            }
-            await update.message.reply_text(
-                "🩺 Опишите симптом:",
-                parse_mode=None
-            )
-            return SYMPTOM_TEXT
-        
-        await update.message.reply_text(
-            "✅ Комментарий сохранен!",
-            reply_markup=InlineKeyboardMarkup([get_main_menu_button()]),
-            parse_mode=None
-        )
-        
-    except Exception as e:
-        log.error(f"Ошибка сохранения комментария: {e}", update=update, exc_info=True)
-        await update.message.reply_text("❌ Ошибка")
+            await query.edit_message_text(f"✅ Лекарство {med.name} удалено", reply_markup=InlineKeyboardMarkup([get_main_menu_button()]))
     finally:
         db.close()
-        if 'comment' in context.user_data:
-            del context.user_data['comment']
-    
-    return ConversationHandler.END
 
-# ============== САМОЧУВСТВИЕ ==============
+async def delete_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаление анализа."""
+    query = update.callback_query
+    await query.answer()
+    
+    ana_id = int(query.data.replace("delete_analysis_", ""))
+    
+    db = get_db()
+    try:
+        ana = db.query(Analysis).filter_by(id=ana_id).first()
+        if ana:
+            ana.status = 'cancelled'
+            for r in db.query(Reminder).filter(
+                Reminder.item_id == ana_id,
+                Reminder.reminder_type == 'analysis',
+                Reminder.status.in_(['pending', 'sent'])
+            ):
+                r.status = 'cancelled'
+                try:
+                    scheduler.scheduler.remove_job(f"analysis_{r.id}")
+                except:
+                    pass
+            db.commit()
+            await query.edit_message_text(f"✅ Анализ {ana.name} удален", reply_markup=InlineKeyboardMarkup([get_main_menu_button()]))
+    finally:
+        db.close()
+
+# ============== ОБРАБОТЧИКИ САМОЧУВСТВИЯ ==============
 
 async def mood_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Оценка настроения."""
@@ -2127,7 +2036,7 @@ async def mood_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=get_mood_keyboard(), parse_mode=None)
 
 async def mood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сохранение оценки настроения."""
+    """Сохранение оценки."""
     query = update.callback_query
     await query.answer()
     
@@ -2140,389 +2049,145 @@ async def mood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.add(mood)
         db.commit()
         
-        # Проверка на ухудшение
-        recent = db.query(MoodLog).filter(
-            MoodLog.user_id == user_id
-        ).order_by(MoodLog.created_at.desc()).limit(2).all()
-        
-        if len(recent) == 2 and all(m.mood_score <= 2 for m in recent):
-            keyboard = [
-                [
-                    InlineKeyboardButton("👨‍⚕️ Записаться", callback_data="about"),
-                    InlineKeyboardButton("✅ Отметить визит", callback_data="doctor_visited"),
-                ],
-                get_main_menu_button()
-            ]
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="⚠️ Зафиксировано ухудшение самочувствия два дня подряд. Рекомендуется обратиться к врачу.",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        
         texts = {1: "😢 Очень плохо", 2: "🙁 Плохо", 3: "😐 Нормально", 4: "🙂 Хорошо", 5: "😊 Отлично"}
         local = utc_to_local(mood.created_at, get_user_timezone(user_id))
         
-        keyboard = [
-            [InlineKeyboardButton("🩺 Отметить симптомы", callback_data="symptoms")],
-            get_main_menu_button()
-        ]
-        
         await query.edit_message_text(
             f"✅ {texts[score]}\n📅 {local.strftime('%d.%m.%Y %H:%M')}",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=None
-        )
-    finally:
-        db.close()
-
-async def doctor_visited(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отметка о визите к врачу."""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = update.effective_user.id
-    
-    db = get_db()
-    try:
-        visit = DoctorVisitLog(user_id=user_id, notes="Посещение врача")
-        db.add(visit)
-        db.commit()
-        
-        await query.edit_message_text(
-            "✅ Визит к врачу отмечен!\n\nХорошо, что вы обратились к специалисту.",
             reply_markup=InlineKeyboardMarkup([get_main_menu_button()]),
             parse_mode=None
         )
     finally:
         db.close()
 
-# ============== СИМПТОМЫ ==============
+# ============== ОБРАБОТЧИКИ СТАТИСТИКИ ==============
 
-async def symptoms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Добавление симптома."""
-    text = "🩺 Какие симптомы вас беспокоят?\n\nВведите симптом текстом:"
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда статистики."""
+    text = "📈 *Статистика*\n\nВыберите тип статистики:"
     
     if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Назад", callback_data="mood")],
-                [InlineKeyboardButton("🗑️ Управление симптомами", callback_data="manage_symptoms")],
-                get_main_menu_button()
-            ]),
-            parse_mode=None
-        )
+        await update.callback_query.edit_message_text(text, reply_markup=get_stats_keyboard(), parse_mode=None)
     else:
-        await update.message.reply_text(
-            text,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Назад", callback_data="mood")],
-                [InlineKeyboardButton("🗑️ Управление симптомами", callback_data="manage_symptoms")],
-                get_main_menu_button()
-            ]),
-            parse_mode=None
-        )
-    return SYMPTOM_TEXT
+        await update.message.reply_text(text, reply_markup=get_stats_keyboard(), parse_mode=None)
 
-async def symptom_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Текст симптома."""
-    context.user_data['symptom'] = update.message.text
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("1 🔴 Минимальная", callback_data="severity_1"),
-            InlineKeyboardButton("2 🟠 Легкая", callback_data="severity_2"),
-        ],
-        [
-            InlineKeyboardButton("3 🟡 Умеренная", callback_data="severity_3"),
-            InlineKeyboardButton("4 🟢 Сильная", callback_data="severity_4"),
-        ],
-        [
-            InlineKeyboardButton("5 🔵 Максимальная", callback_data="severity_5"),
-        ],
-        [
-            InlineKeyboardButton("🔙 Назад", callback_data="mood"),
-            get_main_menu_button()[0]
-        ]
-    ]
-    
-    await update.message.reply_text(
-        "🩺 Оцените тяжесть симптома (1-5):",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=None
-    )
-    return SYMPTOM_SEVERITY
-
-async def symptom_severity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сохранение симптома."""
+async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора статистики."""
     query = update.callback_query
     await query.answer()
     
-    severity = int(query.data.replace("severity_", ""))
-    
-    # Проверяем, пришли ли мы из комментария к лекарству
-    if 'symptom_from_medicine' in context.user_data:
-        symptom = context.user_data['symptom']
-        from_medicine = context.user_data['symptom_from_medicine']
-        del context.user_data['symptom_from_medicine']
-    else:
-        symptom = context.user_data.get('symptom', 'Не указан')
-        from_medicine = None
-    
     user_id = update.effective_user.id
-    
+    tz = get_user_timezone(user_id)
     db = get_db()
+    
     try:
-        log_entry = SymptomLog(
-            user_id=user_id,
-            symptom=symptom,
-            severity=severity
-        )
-        db.add(log_entry)
-        db.commit()
-        
-        local = utc_to_local(log_entry.created_at, get_user_timezone(user_id))
-        
-        texts = {
-            1: "1️⃣ Минимальная (🔴)",
-            2: "2️⃣ Легкая (🟠)",
-            3: "3️⃣ Умеренная (🟡)",
-            4: "4️⃣ Сильная (🟢)",
-            5: "5️⃣ Максимальная (🔵)"
-        }
-        
-        if from_medicine:
-            # Возвращаемся к напоминанию о лекарстве
-            med_id = from_medicine['medicine_id']
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 К лекарству", callback_data=f"back_to_medicine_{med_id}"),
-                get_main_menu_button()[0]
-            ]])
+        if query.data == "stats_week":
+            week_ago = datetime.now(pytz.UTC) - timedelta(days=7)
+            
+            mood = db.query(MoodLog).filter(
+                MoodLog.user_id == user_id,
+                MoodLog.created_at >= week_ago
+            ).all()
+            
+            symptoms = db.query(SymptomLog).filter(
+                SymptomLog.user_id == user_id,
+                SymptomLog.created_at >= week_ago
+            ).all()
+            
+            avg_mood = sum(m.mood_score for m in mood) / len(mood) if mood else 0
+            
+            text = f"""📊 *Статистика за неделю*
+
+😊 Настроение: {len(mood)} записей, среднее {avg_mood:.1f}/5
+🩺 Симптомы: {len(symptoms)} записей"""
+            
+        elif query.data == "stats_month":
+            month_ago = datetime.now(pytz.UTC) - timedelta(days=30)
+            
+            mood = db.query(MoodLog).filter(
+                MoodLog.user_id == user_id,
+                MoodLog.created_at >= month_ago
+            ).all()
+            
+            avg_mood = sum(m.mood_score for m in mood) / len(mood) if mood else 0
+            
+            text = f"""📊 *Статистика за месяц*
+
+😊 Настроение: {len(mood)} записей, среднее {avg_mood:.1f}/5"""
+            
+        elif query.data == "stats_all":
+            mood = db.query(MoodLog).filter(MoodLog.user_id == user_id).all()
+            symptoms = db.query(SymptomLog).filter(SymptomLog.user_id == user_id).all()
+            
+            avg_mood = sum(m.mood_score for m in mood) / len(mood) if mood else 0
+            
+            text = f"""📊 *Вся статистика*
+
+😊 Настроение: {len(mood)} записей, среднее {avg_mood:.1f}/5
+🩺 Симптомы: {len(symptoms)} записей"""
+            
+        elif query.data == "stats_mood":
+            mood = db.query(MoodLog).filter(
+                MoodLog.user_id == user_id
+            ).order_by(MoodLog.created_at.desc()).limit(10).all()
+            
+            if not mood:
+                await query.edit_message_text("📊 Нет данных о настроении")
+                return
+            
+            text = "📈 *Последние оценки настроения:*\n\n"
+            for m in mood:
+                local = utc_to_local(m.created_at, tz)
+                emoji = "😢" if m.mood_score <=2 else "😐" if m.mood_score==3 else "😊"
+                text += f"{local.strftime('%d.%m %H:%M')}: {emoji} {m.mood_score}/5\n"
+            
+        elif query.data == "stats_symptoms":
+            symptoms = db.query(SymptomLog).filter(
+                SymptomLog.user_id == user_id
+            ).order_by(SymptomLog.created_at.desc()).limit(10).all()
+            
+            if not symptoms:
+                await query.edit_message_text("📊 Нет данных о симптомах")
+                return
+            
+            text = "🩺 *Последние симптомы:*\n\n"
+            for s in symptoms:
+                local = utc_to_local(s.created_at, tz)
+                text += f"{local.strftime('%d.%m %H:%M')}: {s.symptom} ({s.severity}/5)\n"
+            
+        elif query.data == "stats_medicine":
+            meds = db.query(MedicineLog).filter(
+                MedicineLog.user_id == user_id
+            ).order_by(MedicineLog.taken_at.desc()).limit(10).all()
+            
+            if not meds:
+                await query.edit_message_text("📊 Нет данных о лекарствах")
+                return
+            
+            text = "💊 *Последние приемы лекарств:*\n\n"
+            for m in meds:
+                local = utc_to_local(m.taken_at, tz)
+                status = "✅" if m.status in ['taken', 'extra'] else "❌"
+                plan = "📅" if m.is_planned else "➕"
+                medicine = db.query(Medicine).filter_by(id=m.medicine_id).first()
+                name = medicine.name if medicine else "Неизвестно"
+                text += f"{local.strftime('%d.%m %H:%M')}: {status}{plan} {name}\n"
         else:
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ Добавить еще", callback_data="symptoms")],
-                [InlineKeyboardButton("🗑️ Управление симптомами", callback_data="manage_symptoms")],
-                get_main_menu_button()
-            ])
+            text = "📈 Выберите тип статистики"
         
         await query.edit_message_text(
-            f"✅ Симптом зафиксирован:\n\n🤒 {symptom}\n📊 {texts[severity]}\n📅 {local.strftime('%d.%m.%Y %H:%M')}",
-            reply_markup=keyboard,
+            text,
+            reply_markup=InlineKeyboardMarkup([get_main_menu_button()]),
             parse_mode=None
         )
         
-    finally:
-        db.close()
-        context.user_data.pop('symptom', None)
-    
-    return ConversationHandler.END
-
-async def manage_symptoms_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Управление симптомами (удаление)."""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = update.effective_user.id
-    page = int(context.user_data.get('symptom_page', 0))
-    
-    keyboard = get_symptom_list_keyboard(user_id, page)
-    if not keyboard:
-        await query.edit_message_text("📭 Нет симптомов для удаления")
-        return
-    
-    await query.edit_message_text(
-        "🗑️ *Выберите симптом для удаления:*",
-        reply_markup=keyboard,
-        parse_mode=None
-    )
-
-async def delete_symptom_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаление симптома."""
-    query = update.callback_query
-    await query.answer()
-    
-    symptom_id = int(query.data.replace("delete_symptom_", ""))
-    user_id = update.effective_user.id
-    
-    db = get_db()
-    try:
-        symptom = db.query(SymptomLog).filter_by(id=symptom_id, user_id=user_id).first()
-        if symptom:
-            db.delete(symptom)
-            db.commit()
-            await query.edit_message_text("✅ Симптом удален!")
-        else:
-            await query.edit_message_text("❌ Симптом не найден")
-    finally:
-        db.close()
-    
-    await manage_symptoms_callback(update, context)
-
-# ============== ОТКЛАДЫВАНИЕ АНАЛИЗОВ ==============
-
-async def postpone_analysis_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало откладывания анализа."""
-    query = update.callback_query
-    await query.answer()
-    
-    analysis_id = int(query.data.replace("postpone_analysis_", ""))
-    context.user_data['postpone'] = {'analysis_id': analysis_id}
-    
-    await query.edit_message_text(
-        "⏸ На сколько дней отложить анализ?",
-        reply_markup=get_postpone_keyboard("analysis", analysis_id),
-        parse_mode=None
-    )
-    return POSTPONE_ANALYSIS
-
-async def postpone_analysis_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка выбора дней откладывания."""
-    if update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        
-        if query.data == "postpone_analysis_custom":
-            await query.edit_message_text("Введите количество дней (от 1 до 365):")
-            return POSTPONE_ANALYSIS
-        
-        parts = query.data.split('_')
-        days = int(parts[3])
-        await process_analysis_postpone(query, context, days)
-    else:
-        try:
-            days = int(update.message.text.strip())
-            if days < 1 or days > 365:
-                raise ValueError
-            await process_analysis_postpone(update.message, context, days)
-        except:
-            await update.message.reply_text("❌ Введите число от 1 до 365")
-            return POSTPONE_ANALYSIS
-    
-    return ConversationHandler.END
-
-async def process_analysis_postpone(obj, context: ContextTypes.DEFAULT_TYPE, days: int):
-    """Обработка откладывания анализа."""
-    analysis_id = context.user_data['postpone']['analysis_id']
-    user_id = obj.from_user.id
-    
-    db = get_db()
-    try:
-        analysis = db.query(Analysis).filter_by(id=analysis_id).first()
-        if not analysis:
-            await obj.reply_text("❌ Анализ не найден")
-            return
-        
-        reminder = db.query(Reminder).filter(
-            Reminder.item_id == analysis_id,
-            Reminder.reminder_type == 'analysis',
-            Reminder.status == 'sent'
-        ).order_by(Reminder.scheduled_time.desc()).first()
-        
-        if reminder:
-            reminder.status = 'postponed'
-            reminder.postponed_until = datetime.now(pytz.UTC) + timedelta(days=days)
-            reminder.postponed_days = days
-            
-            log_entry = AnalysisLog(
-                analysis_id=analysis_id,
-                user_id=user_id,
-                status='postponed',
-                notes=f"Отложено на {days} дн."
-            )
-            db.add(log_entry)
-            db.commit()
-            
-            local_date = utc_to_local(reminder.postponed_until, get_user_timezone(user_id))
-            text = f"✅ Анализ {analysis.name} отложен на {days} дней.\nНапоминание возобновится {local_date.strftime('%d.%m.%Y')}."
-            
-            keyboard = [
-                [InlineKeyboardButton("📋 Список анализов", callback_data="list_analyses")],
-                get_main_menu_button()
-            ]
-            
-            if hasattr(obj, 'edit_message_text'):
-                await obj.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-            else:
-                await obj.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        else:
-            await obj.reply_text("❌ Активное напоминание не найдено")
-            
     except Exception as e:
-        log.error(f"Ошибка откладывания анализа: {e}", exc_info=True)
-        await obj.reply_text("❌ Ошибка")
-    finally:
-        db.close()
-        context.user_data.pop('postpone', None)
-
-async def cancel_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отмена анализа."""
-    query = update.callback_query
-    await query.answer()
-    
-    analysis_id = int(query.data.replace("cancel_analysis_", ""))
-    
-    db = get_db()
-    try:
-        analysis = db.query(Analysis).filter_by(id=analysis_id).first()
-        if analysis:
-            analysis.status = 'cancelled'
-            for r in db.query(Reminder).filter(
-                Reminder.item_id == analysis_id,
-                Reminder.reminder_type == 'analysis',
-                Reminder.status.in_(['pending', 'sent'])
-            ):
-                r.status = 'cancelled'
-                try:
-                    scheduler.scheduler.remove_job(f"analysis_{r.id}")
-                except:
-                    pass
-            db.commit()
-            
-            await query.edit_message_text(
-                f"✅ Анализ {analysis.name} удален",
-                reply_markup=InlineKeyboardMarkup([get_main_menu_button()]),
-                parse_mode=None
-            )
+        log.error(f"STATS ERROR: {e}")
+        await query.edit_message_text("❌ Ошибка при получении статистики")
     finally:
         db.close()
 
-async def analysis_notes_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Заметки к анализу."""
-    query = update.callback_query
-    await query.answer()
-    
-    analysis_id = int(query.data.replace("analysis_notes_", ""))
-    context.user_data['analysis_notes_id'] = analysis_id
-    
-    await query.edit_message_text(
-        "📝 Введите заметки к анализу:",
-        parse_mode=None
-    )
-    return ANALYSIS_CONFIRM
-
-async def analysis_notes_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сохранение заметок к анализу."""
-    notes = update.message.text
-    analysis_id = context.user_data.get('analysis_notes_id')
-    
-    db = get_db()
-    try:
-        analysis = db.query(Analysis).filter_by(id=analysis_id).first()
-        if analysis:
-            analysis.notes = notes
-            db.commit()
-            await update.message.reply_text(
-                "✅ Заметки сохранены!",
-                reply_markup=InlineKeyboardMarkup([get_main_menu_button()]),
-                parse_mode=None
-            )
-    finally:
-        db.close()
-        context.user_data.pop('analysis_notes_id', None)
-    
-    return ConversationHandler.END
-
-# ============== НАПОМИНАНИЯ ==============
+# ============== ОБРАБОТЧИКИ НАПОМИНАНИЙ ==============
 
 async def send_reminder_job(reminder_id: int):
     """Отправка напоминания."""
@@ -2543,13 +2208,7 @@ async def send_reminder_job(reminder_id: int):
                 db.commit()
                 return
             
-            if medicine.paused_until and medicine.paused_until > datetime.now(pytz.UTC):
-                reminder.status = 'postponed'
-                reminder.postponed_until = medicine.paused_until
-                db.commit()
-                return
-            
-            text = f"💊 *Время принять лекарство!*\n\n{medicine.name}"
+            text = f"💊 Время принять лекарство!\n\n{medicine.name}"
             keyboard = get_medicine_inline_keyboard(medicine.id)
             
         elif reminder.reminder_type == 'analysis':
@@ -2559,18 +2218,8 @@ async def send_reminder_job(reminder_id: int):
                 db.commit()
                 return
             
-            if analysis.paused_until and analysis.paused_until > datetime.now(pytz.UTC):
-                reminder.status = 'postponed'
-                reminder.postponed_until = analysis.paused_until
-                db.commit()
-                return
-            
-            date = analysis.scheduled_date
-            if date.tzinfo is None:
-                date = pytz.UTC.localize(date)
-            local = utc_to_local(date, analysis.user_timezone)
-            
-            text = f"🩺 *Напоминание об анализе!*\n\n{analysis.name}\n📅 {local.strftime('%d.%m.%Y')} в {analysis.scheduled_time}"
+            local = utc_to_local(analysis.scheduled_date, analysis.user_timezone)
+            text = f"🩺 Напоминание об анализе!\n\n{analysis.name}\n📅 {local.strftime('%d.%m.%Y %H:%M')}"
             if analysis.notes:
                 text += f"\n\n📝 Заметки: {analysis.notes}"
             
@@ -2578,44 +2227,22 @@ async def send_reminder_job(reminder_id: int):
         else:
             return
         
-        for attempt in range(3):
-            try:
-                await rate_limiter.acquire(user_id)
-                await application.bot.send_message(
-                    chat_id=user_id,
-                    text=text,
-                    reply_markup=keyboard,
-                    parse_mode=None
-                )
-                reminder.status = 'sent'
-                reminder.retry_count = attempt + 1
-                db.commit()
-                log.info(f"✅ Напоминание {reminder_id} отправлено {user_id}")
-                return
-                
-            except (RetryAfter, TimedOut) as e:
-                reminder.retry_count = attempt + 1
-                reminder.last_error = str(e)
-                db.commit()
-                log.warning(f"⚠️ Попытка {attempt+1} для {reminder_id} не удалась: {e}")
-                if attempt < 2:
-                    await asyncio.sleep(5 * (attempt + 1))
-            except Exception as e:
-                reminder.status = 'failed'
-                reminder.last_error = str(e)
-                db.commit()
-                log.error(f"❌ Ошибка отправки {reminder_id}: {e}")
-                return
+        await rate_limiter.acquire(user_id)
+        await application.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode=None
+        )
         
-        reminder.status = 'failed'
+        reminder.status = 'sent'
         db.commit()
+        log.info(f"✅ Напоминание {reminder_id} отправлено {user_id}")
         
     except Exception as e:
-        log.error(f"❌ Критическая ошибка в send_reminder_job: {e}")
+        log.error(f"❌ Ошибка отправки {reminder_id}: {e}")
     finally:
         db.close()
-
-# ============== ОБРАБОТЧИКИ ПРИЕМА ==============
 
 async def medicine_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Прием лекарства."""
@@ -2632,8 +2259,7 @@ async def medicine_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
             medicine_id=med_id,
             user_id=user_id,
             status='taken',
-            is_planned=True,
-            course_info=f"{med.course_type} ({med.course_days or '∞'} дн.)"
+            is_planned=True
         )
         db.add(log_entry)
         
@@ -2702,6 +2328,7 @@ async def analysis_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     db = get_db()
     try:
+        ana = db.query(Analysis).filter_by(id=ana_id).first()
         log_entry = AnalysisLog(
             analysis_id=ana_id,
             user_id=user_id,
@@ -2709,7 +2336,6 @@ async def analysis_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         db.add(log_entry)
         
-        ana = db.query(Analysis).filter_by(id=ana_id).first()
         if ana:
             ana.status = 'completed'
         
@@ -2724,7 +2350,7 @@ async def analysis_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.commit()
         
         await query.edit_message_text(
-            f"✅ Отлично! Сдача анализа {ana.name} отмечена.",
+            f"✅ Отлично! Анализ {ana.name} отмечен.",
             reply_markup=InlineKeyboardMarkup([get_main_menu_button()]),
             parse_mode=None
         )
@@ -2741,6 +2367,7 @@ async def analysis_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     db = get_db()
     try:
+        ana = db.query(Analysis).filter_by(id=ana_id).first()
         log_entry = AnalysisLog(
             analysis_id=ana_id,
             user_id=user_id,
@@ -2748,7 +2375,6 @@ async def analysis_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         db.add(log_entry)
         
-        ana = db.query(Analysis).filter_by(id=ana_id).first()
         if ana:
             ana.status = 'skipped'
         
@@ -2770,795 +2396,7 @@ async def analysis_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         db.close()
 
-# ============== СПИСКИ ==============
-
-async def list_medicines(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Список лекарств."""
-    user_id = update.effective_user.id
-    
-    query = update.callback_query
-    if query:
-        await query.answer()
-    
-    db = get_db()
-    try:
-        medicines = db.query(Medicine).filter(
-            Medicine.user_id == user_id,
-            Medicine.status == 'active'
-        ).order_by(Medicine.created_at.desc()).all()
-        
-        if not medicines:
-            text = "📋 У вас нет активных лекарств"
-            keyboard = [[InlineKeyboardButton("💊 Добавить лекарство", callback_data="add_medicine")], get_main_menu_button()]
-        else:
-            text = "📋 Ваши лекарства:\n\n"
-            keyboard = []
-            for i, m in enumerate(medicines, 1):
-                if m.paused_until and m.paused_until > datetime.now(pytz.UTC):
-                    pause = f" (пауза до {utc_to_local(m.paused_until, m.user_timezone).strftime('%d.%m')})"
-                else:
-                    pause = ""
-                times_str = m.times.replace(",", ", ")
-                text += f"{i}. {m.name}{pause}\n   ⏰ {times_str} ({m.frequency} раз/день)\n"
-                keyboard.append([InlineKeyboardButton(f"🗑️ Удалить {m.name}", callback_data=f"delete_medicine_{m.id}")])
-            keyboard.append([InlineKeyboardButton("💊 Добавить лекарство", callback_data="add_medicine")])
-            keyboard.append(get_main_menu_button())
-        
-        if query:
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
-        else:
-            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
-    finally:
-        db.close()
-
-async def list_analyses(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Список анализов."""
-    user_id = update.effective_user.id
-    
-    query = update.callback_query
-    if query:
-        await query.answer()
-    
-    db = get_db()
-    try:
-        analyses = db.query(Analysis).filter(
-            Analysis.user_id == user_id,
-            Analysis.status == 'pending'
-        ).order_by(Analysis.scheduled_date.asc()).all()
-        
-        if not analyses:
-            text = "📋 У вас нет запланированных анализов"
-            keyboard = [[InlineKeyboardButton("🩺 Добавить анализ", callback_data="add_analysis")], get_main_menu_button()]
-        else:
-            text = "📋 Запланированные анализы:\n\n"
-            keyboard = []
-            now = datetime.now(pytz.UTC)
-            for i, a in enumerate(analyses, 1):
-                if a.scheduled_date.tzinfo is None:
-                    date = pytz.UTC.localize(a.scheduled_date)
-                else:
-                    date = a.scheduled_date
-                local = utc_to_local(date, a.user_timezone)
-                days = (date - now).days
-                status = "🔴 Просрочен" if days < 0 else "🟡 Сегодня" if days == 0 else f"🟢 Через {days} дн."
-                text += f"{i}. {a.name}\n   📅 {local.strftime('%d.%m.%Y')} в {a.scheduled_time} - {status}\n"
-                text += f"   ⏰ Напомнить за {a.reminder_minutes} мин.\n"
-                keyboard.append([InlineKeyboardButton(f"🗑️ Удалить {a.name}", callback_data=f"delete_analysis_{a.id}")])
-            keyboard.append([InlineKeyboardButton("🩺 Добавить анализ", callback_data="add_analysis")])
-            keyboard.append(get_main_menu_button())
-        
-        if query:
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
-        else:
-            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
-    finally:
-        db.close()
-
-async def delete_medicine(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаление лекарства."""
-    query = update.callback_query
-    await query.answer()
-    
-    med_id = int(query.data.replace("delete_medicine_", ""))
-    
-    db = get_db()
-    try:
-        med = db.query(Medicine).filter_by(id=med_id).first()
-        if med:
-            med.status = 'deleted'
-            for r in db.query(Reminder).filter(
-                Reminder.item_id == med_id,
-                Reminder.reminder_type == 'medicine',
-                Reminder.status.in_(['pending', 'sent'])
-            ):
-                r.status = 'cancelled'
-                try:
-                    scheduler.scheduler.remove_job(f"medicine_{r.id}")
-                except:
-                    pass
-            db.commit()
-            await query.edit_message_text(f"✅ Лекарство {med.name} удалено", reply_markup=InlineKeyboardMarkup([get_main_menu_button()]))
-    finally:
-        db.close()
-
-async def delete_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаление анализа."""
-    query = update.callback_query
-    await query.answer()
-    
-    ana_id = int(query.data.replace("delete_analysis_", ""))
-    
-    db = get_db()
-    try:
-        ana = db.query(Analysis).filter_by(id=ana_id).first()
-        if ana:
-            ana.status = 'cancelled'
-            for r in db.query(Reminder).filter(
-                Reminder.item_id == ana_id,
-                Reminder.reminder_type == 'analysis',
-                Reminder.status.in_(['pending', 'sent'])
-            ):
-                r.status = 'cancelled'
-                try:
-                    scheduler.scheduler.remove_job(f"analysis_{r.id}")
-                except:
-                    pass
-            db.commit()
-            await query.edit_message_text(f"✅ Анализ {ana.name} удален", reply_markup=InlineKeyboardMarkup([get_main_menu_button()]))
-    finally:
-        db.close()
-
-# ============== СТАТИСТИКА ==============
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда статистики."""
-    text = "📈 *Статистика*\n\nВыберите тип статистики:"
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("📊 За неделю", callback_data="stats_week"),
-            InlineKeyboardButton("📊 За месяц", callback_data="stats_month"),
-        ],
-        [
-            InlineKeyboardButton("📊 За все время", callback_data="stats_all"),
-            InlineKeyboardButton("📊 Настроение", callback_data="stats_mood"),
-        ],
-        [
-            InlineKeyboardButton("📊 Симптомы", callback_data="stats_symptoms"),
-            InlineKeyboardButton("💊 Лекарства", callback_data="stats_medicine"),
-        ],
-        get_main_menu_button()
-    ]
-    
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
-
-async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка выбора статистики."""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = update.effective_user.id
-    tz = get_user_timezone(user_id)
-    db = get_db()
-    
-    try:
-        if query.data == "stats_week":
-            week_ago = datetime.now(pytz.UTC) - timedelta(days=7)
-            
-            mood = db.query(MoodLog).filter(
-                MoodLog.user_id == user_id,
-                MoodLog.created_at >= week_ago
-            ).order_by(MoodLog.created_at.desc()).all()
-            
-            symptoms = db.query(SymptomLog).filter(
-                SymptomLog.user_id == user_id,
-                SymptomLog.created_at >= week_ago
-            ).order_by(SymptomLog.created_at.desc()).all()
-            
-            meds = db.query(MedicineLog).filter(
-                MedicineLog.user_id == user_id,
-                MedicineLog.taken_at >= week_ago
-            ).order_by(MedicineLog.taken_at.desc()).all()
-            
-            avg_mood = sum(m.mood_score for m in mood) / len(mood) if mood else 0
-            
-            text = f"""📊 *Статистика за неделю*
-
-😊 *Настроение:* {len(mood)} записей, среднее {avg_mood:.1f}/5
-🩺 *Симптомы:* {len(symptoms)} записей
-💊 *Лекарства:* {len([m for m in meds if m.status in ['taken', 'extra']])} приемов, {len([m for m in meds if m.status == 'skipped'])} пропусков"""
-            
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup([get_main_menu_button()]),
-                parse_mode=None
-            )
-            
-        elif query.data == "stats_mood":
-            mood = db.query(MoodLog).filter(
-                MoodLog.user_id == user_id
-            ).order_by(MoodLog.created_at.desc()).limit(30).all()
-            
-            if not mood:
-                await query.edit_message_text("📊 Нет данных о настроении")
-                return
-            
-            text = "📈 *Детальная статистика настроения:*\n\n"
-            for m in mood[:20]:
-                local = utc_to_local(m.created_at, tz)
-                emoji = "😢" if m.mood_score <=2 else "😐" if m.mood_score==3 else "😊"
-                text += f"{local.strftime('%d.%m %H:%M')}: {emoji} {m.mood_score}/5"
-                if m.comment:
-                    text += f" ({m.comment})"
-                text += "\n"
-            
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup([get_main_menu_button()]),
-                parse_mode=None
-            )
-            
-        elif query.data == "stats_symptoms":
-            symptoms = db.query(SymptomLog).filter(
-                SymptomLog.user_id == user_id
-            ).order_by(SymptomLog.created_at.desc()).all()
-            
-            if not symptoms:
-                await query.edit_message_text("📊 Нет данных о симптомах")
-                return
-            
-            text = "🩺 *Детальная статистика симптомов:*\n\n"
-            for s in symptoms[:15]:
-                local = utc_to_local(s.created_at, tz)
-                text += f"{local.strftime('%d.%m %H:%M')}: {s.symptom} ({s.severity}/5)"
-                if s.comment:
-                    text += f" - {s.comment}"
-                text += "\n"
-            
-            keyboard = [
-                [InlineKeyboardButton("🗑️ Управление симптомами", callback_data="manage_symptoms")],
-                get_main_menu_button()
-            ]
-            
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=None
-            )
-            
-        elif query.data == "stats_medicine":
-            meds = db.query(MedicineLog).filter(
-                MedicineLog.user_id == user_id
-            ).order_by(MedicineLog.taken_at.desc()).all()
-            
-            if not meds:
-                await query.edit_message_text("📊 Нет данных о лекарствах")
-                return
-            
-            planned = [m for m in meds if m.is_planned and m.status in ['taken', 'extra']]
-            unplanned = [m for m in meds if not m.is_planned and m.status in ['taken', 'extra']]
-            skipped = [m for m in meds if m.status == 'skipped']
-            
-            text = f"""💊 *Детальная статистика лекарств*
-
-📅 *Всего приемов:* {len(meds)}
-✅ *Запланированные:* {len(planned)}
-➕ *Внеплановые:* {len(unplanned)}
-❌ *Пропущено:* {len(skipped)}
-
-*Последние приемы:*\n"""
-            
-            for m in meds[:10]:
-                local = utc_to_local(m.taken_at, tz)
-                status = "✅" if m.status in ['taken', 'extra'] else "❌"
-                plan = "📅" if m.is_planned else "➕"
-                text += f"{local.strftime('%d.%m %H:%M')}: {status}{plan} "
-                medicine = db.query(Medicine).filter_by(id=m.medicine_id).first()
-                name = medicine.name if medicine else "Неизвестно"
-                text += f"{name}"
-                if m.dosage:
-                    text += f" ({m.dosage})"
-                if m.comment:
-                    text += f"\n   📝 {m.comment[:50]}"
-                text += "\n"
-            
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup([get_main_menu_button()]),
-                parse_mode=None
-            )
-            
-    finally:
-        db.close()
-
-# ============== АДМИН-КОМАНДЫ ==============
-
-@admin_only
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Панель администратора."""
-    await update.message.reply_text(
-        "🔐 *Панель администратора*\n\nВыберите раздел:",
-        reply_markup=get_admin_panel_keyboard(),
-        parse_mode=None
-    )
-    log.info(f"🔐 Админ-панель открыта", update=update)
-
-@admin_only
-async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Статистика бота."""
-    query = update.callback_query
-    await query.answer()
-    
-    db = get_db()
-    try:
-        total_users = db.query(User).count()
-        active_today = db.query(User).filter(
-            User.last_activity >= datetime.now(pytz.UTC) - timedelta(days=1)
-        ).count()
-        active_week = db.query(User).filter(
-            User.last_activity >= datetime.now(pytz.UTC) - timedelta(days=7)
-        ).count()
-        total_medicines = db.query(Medicine).count()
-        active_medicines = db.query(Medicine).filter(Medicine.status == 'active').count()
-        total_analyses = db.query(Analysis).count()
-        today_actions = db.query(AdminLog).filter(
-            AdminLog.created_at >= datetime.now(pytz.UTC) - timedelta(days=1)
-        ).count()
-        
-        text = f"""📊 *Статистика бота*
-
-👥 *Пользователи:*
-• Всего: {total_users}
-• Активных сегодня: {active_today}
-• Активных за неделю: {active_week}
-
-💊 *Лекарства:*
-• Всего: {total_medicines}
-• Активных: {active_medicines}
-
-🩺 *Анализы:*
-• Всего: {total_analyses}
-
-📈 *Активность:*
-• Действий сегодня: {today_actions}
-• В среднем: {today_actions/max(total_users,1):.1f}"""
-        
-        await query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")]]),
-            parse_mode=None
-        )
-    finally:
-        db.close()
-
-@admin_only
-async def admin_logs_errors_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Последние ошибки."""
-    query = update.callback_query
-    await query.answer()
-    
-    error_log = LOG_DIR / "error.log"
-    if not error_log.exists():
-        await query.edit_message_text("📭 Файл с ошибками пока пуст")
-        return
-    
-    with open(error_log, 'r', encoding='utf-8') as f:
-        lines = f.readlines()[-20:]
-    
-    if not lines:
-        await query.edit_message_text("✅ Ошибок не обнаружено!")
-        return
-    
-    text = "🚨 *Последние ошибки:*\n\n"
-    for line in reversed(lines[-10:]):
-        if len(line) > 200:
-            line = line[:200] + "..."
-        text += f"`{line.strip()}`\n"
-    
-    text += f"\n📊 Всего ошибок: {len(lines)}"
-    
-    keyboard = [
-        [InlineKeyboardButton("🔄 Обновить", callback_data="admin_logs_errors")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="admin_logs")]
-    ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
-
-@admin_only
-async def admin_backup_create_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Создание бэкапа."""
-    query = update.callback_query
-    await query.answer()
-    
-    await query.edit_message_text("🔄 Создаю резервную копию...")
-    backup_path = backup_manager.create_backup("manual")
-    
-    if backup_path:
-        await query.edit_message_text(
-            f"✅ Бэкап успешно создан!\n\n📁 Путь: `{backup_path.name}`",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_backups")]]),
-            parse_mode=None
-        )
-    else:
-        await query.edit_message_text("❌ Ошибка при создании бэкапа")
-
-@admin_only
-async def admin_backup_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Список бэкапов."""
-    query = update.callback_query
-    await query.answer()
-    
-    backups = backup_manager.get_backups()
-    
-    if not backups:
-        await query.edit_message_text("📭 Нет сохраненных бэкапов")
-        return
-    
-    text = "📋 *Доступные бэкапы:*\n\n"
-    keyboard = []
-    
-    for backup in backups[:10]:
-        try:
-            date = datetime.strptime(backup['timestamp'], '%Y%m%d_%H%M%S')
-            date_str = date.strftime('%d.%m.%Y %H:%M')
-        except:
-            date_str = backup['timestamp']
-        
-        emoji = {'auto': '🤖', 'manual': '👤', 'pre_update': '🔄'}.get(backup['type'], '📦')
-        text += f"{emoji} {date_str} - {backup['size_kb']:.0f} KB\n"
-        keyboard.append([InlineKeyboardButton(
-            f"{emoji} {date_str}",
-            callback_data=f"admin_backup_info_{backup['name']}"
-        )])
-    
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="admin_backups")])
-    
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=None
-    )
-
-@admin_only
-async def admin_backup_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Информация о бэкапе."""
-    query = update.callback_query
-    await query.answer()
-    
-    backup_name = query.data.replace("admin_backup_info_", "")
-    backups = backup_manager.get_backups()
-    backup = next((b for b in backups if b['name'] == backup_name), None)
-    
-    if not backup:
-        await query.edit_message_text("❌ Бэкап не найден")
-        return
-    
-    try:
-        date = datetime.strptime(backup['timestamp'], '%Y%m%d_%H%M%S')
-        date_str = date.strftime('%d.%m.%Y %H:%M:%S')
-    except:
-        date_str = backup['timestamp']
-    
-    type_names = {'auto': '🤖 Автоматический', 'manual': '👤 Ручной', 'pre_update': '🔄 Пред-обновление'}
-    type_display = type_names.get(backup['type'], f'📦 {backup["type"]}')
-    
-    text = f"""📁 *Информация о бэкапе*
-
-📌 *Имя:* `{backup_name}`
-📊 *Тип:* {type_display}
-🕐 *Дата:* {date_str}
-📦 *Файлов:* {len(backup['files'])}
-📈 *Размер:* {backup['size_kb']:.1f} KB"""
-
-    if backup['stats']:
-        text += "\n\n📋 *Состав:*\n" + "\n".join(f"• {s}" for s in backup['stats'])
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("🔄 Восстановить", callback_data=f"admin_backup_restore_{backup_name}"),
-            InlineKeyboardButton("📥 Скачать", callback_data=f"admin_backup_download_{backup_name}")
-        ],
-        [InlineKeyboardButton("🔙 К списку", callback_data="admin_backup_list")]
-    ]
-    
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=None
-    )
-
-@admin_only
-async def admin_backup_restore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Восстановление из бэкапа."""
-    query = update.callback_query
-    await query.answer()
-    
-    backup_name = query.data.replace("admin_backup_restore_", "")
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Да, восстановить", callback_data=f"admin_backup_confirm_{backup_name}"),
-            InlineKeyboardButton("❌ Отмена", callback_data=f"admin_backup_info_{backup_name}")
-        ]
-    ]
-    
-    await query.edit_message_text(
-        f"⚠️ *Внимание!*\n\nВы уверены, что хотите восстановить данные из бэкапа `{backup_name}`?\nТекущие данные будут заменены!",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=None
-    )
-
-@admin_only
-async def admin_backup_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подтверждение восстановления."""
-    query = update.callback_query
-    await query.answer()
-    
-    backup_name = query.data.replace("admin_backup_confirm_", "")
-    
-    await query.edit_message_text("🔄 Восстанавливаю данные...")
-    
-    scheduler.scheduler.pause()
-    success = backup_manager.restore(backup_name)
-    
-    if success:
-        await query.edit_message_text(
-            "✅ *Восстановление завершено!*\n\nПерезапускаю планировщик...",
-            parse_mode=None
-        )
-        scheduler.scheduler.resume()
-        await scheduler.restore_reminders()
-        await context.bot.send_message(
-            chat_id=update.effective_user.id,
-            text="✅ Бот успешно восстановлен!"
-        )
-    else:
-        await query.edit_message_text("❌ Ошибка при восстановлении")
-
-# ============== ЧАСОВЫЕ ПОЯСА ==============
-
-async def set_timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Установка часового пояса."""
-    user_id = update.effective_user.id
-    current = get_user_timezone(user_id)
-    
-    text = f"🕒 Текущий часовой пояс: {current}\n\nВыберите новый:"
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("Москва (UTC+3)", callback_data="tz_Europe/Moscow"),
-            InlineKeyboardButton("СПб (UTC+3)", callback_data="tz_Europe/Moscow"),
-        ],
-        [
-            InlineKeyboardButton("Калининград (UTC+2)", callback_data="tz_Europe/Kaliningrad"),
-            InlineKeyboardButton("Самара (UTC+4)", callback_data="tz_Europe/Samara"),
-        ],
-        [
-            InlineKeyboardButton("Екатеринбург (UTC+5)", callback_data="tz_Asia/Yekaterinburg"),
-            InlineKeyboardButton("Омск (UTC+6)", callback_data="tz_Asia/Omsk"),
-        ],
-        [
-            InlineKeyboardButton("Красноярск (UTC+7)", callback_data="tz_Asia/Krasnoyarsk"),
-            InlineKeyboardButton("Иркутск (UTC+8)", callback_data="tz_Asia/Irkutsk"),
-        ],
-        get_main_menu_button()
-    ]
-    
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
-
-async def timezone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Установка часового пояса."""
-    query = update.callback_query
-    await query.answer()
-    
-    tz = query.data.replace("tz_", "")
-    user_id = update.effective_user.id
-    
-    set_user_timezone(user_id, tz)
-    
-    await query.edit_message_text(
-        f"✅ Часовой пояс установлен: {tz}",
-        reply_markup=InlineKeyboardMarkup([get_main_menu_button()]),
-        parse_mode=None
-    )
-
-# ============== ОБРАБОТЧИК КНОПОК ==============
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Главный обработчик кнопок."""
-    query = update.callback_query
-    data = query.data
-    
-    # Навигация
-    if data == "start":
-        await start_callback(update, context)
-    elif data == "back":
-        await start_callback(update, context)
-    elif data == "help":
-        await help_command(update, context)
-    elif data == "about":
-        await about_command(update, context)
-    elif data == "stats":
-        await stats_command(update, context)
-    elif data.startswith("stats_"):
-        await stats_callback(update, context)
-    
-    # Основные функции
-    elif data == "add_medicine":
-        await add_medicine_start(update, context)
-    elif data == "add_analysis":
-        await add_analysis_start(update, context)
-    elif data == "extra_medicine":
-        await extra_medicine_start(update, context)
-    elif data.startswith("extra_select_"):
-        await extra_medicine_select(update, context)
-    elif data == "skip_dosage":
-        await extra_medicine_dosage(update, context)
-    elif data == "skip_comment":
-        await extra_medicine_comment(update, context)
-    
-    # Списки
-    elif data == "list_medicines":
-        await list_medicines(update, context)
-    elif data == "list_analyses":
-        await list_analyses(update, context)
-    elif data.startswith("delete_medicine_"):
-        await delete_medicine(update, context)
-    elif data.startswith("delete_analysis_"):
-        await delete_analysis(update, context)
-    
-    # Самочувствие
-    elif data == "mood":
-        await mood_command(update, context)
-    elif data.startswith("mood_"):
-        await mood_callback(update, context)
-    elif data == "doctor_visited":
-        await doctor_visited(update, context)
-    elif data == "symptoms":
-        await symptoms_command(update, context)
-    elif data.startswith("severity_"):
-        await symptom_severity(update, context)
-    
-    # Симптомы
-    elif data == "manage_symptoms":
-        await manage_symptoms_callback(update, context)
-    elif data.startswith("symptom_page_"):
-        context.user_data['symptom_page'] = int(data.split('_')[-1])
-        await manage_symptoms_callback(update, context)
-    elif data.startswith("delete_symptom_"):
-        await delete_symptom_callback(update, context)
-    
-    # Прием лекарств
-    elif data.startswith("take_"):
-        await medicine_take(update, context)
-    elif data.startswith("skip_"):
-        await medicine_skip(update, context)
-    elif data.startswith("analysis_take_"):
-        await analysis_take(update, context)
-    elif data.startswith("analysis_skip_"):
-        await analysis_skip(update, context)
-    
-    # Комментарии
-    elif data.startswith("comment_"):
-        if "symptom" in data or "side" in data or "normal" in data:
-            await medicine_comment_type(update, context)
-        else:
-            await medicine_comment_start(update, context)
-    
-    # Откладывание анализов
-    elif data.startswith("postpone_analysis_"):
-        if "custom" in data:
-            await postpone_analysis_days(update, context)
-        elif data.count('_') == 3:
-            await postpone_analysis_days(update, context)
-        else:
-            await postpone_analysis_start(update, context)
-    elif data.startswith("cancel_analysis_"):
-        await cancel_analysis(update, context)
-    elif data.startswith("analysis_notes_"):
-        await analysis_notes_start(update, context)
-    
-    # Часовые пояса
-    elif data == "set_timezone":
-        await set_timezone_command(update, context)
-    elif data.startswith("tz_"):
-        await timezone_callback(update, context)
-    
-    # Админ-панель
-    elif data == "admin_panel":
-        await admin_command(update, context)
-    elif data == "admin_stats":
-        await admin_stats_callback(update, context)
-    elif data == "admin_logs":
-        await admin_logs_callback(update, context)
-    elif data == "admin_logs_errors":
-        await admin_logs_errors_callback(update, context)
-    elif data == "admin_backups":
-        await admin_backups_callback(update, context)
-    elif data == "admin_backup_create":
-        await admin_backup_create_callback(update, context)
-    elif data == "admin_backup_list":
-        await admin_backup_list_callback(update, context)
-    elif data.startswith("admin_backup_info_"):
-        await admin_backup_info_callback(update, context)
-    elif data.startswith("admin_backup_restore_"):
-        await admin_backup_restore_callback(update, context)
-    elif data.startswith("admin_backup_confirm_"):
-        await admin_backup_confirm_callback(update, context)
-    
-    # Телефоны
-    elif data == "phone_kit":
-        await query.answer()
-        await context.bot.send_message(
-            chat_id=update.effective_user.id,
-            text=f"📞 Телефон КИТ-клиники: {KIT_CLINIC['phone_display']}\n\nНажмите на номер: {KIT_CLINIC['phone']}",
-            reply_markup=InlineKeyboardMarkup([get_main_menu_button()])
-        )
-    elif data == "phone_family":
-        await query.answer()
-        await context.bot.send_message(
-            chat_id=update.effective_user.id,
-            text=f"📞 Телефон Семейной клиники: {FAMILY_CLINIC['phone_display']}\n\nНажмите на номер: {FAMILY_CLINIC['phone']}",
-            reply_markup=InlineKeyboardMarkup([get_main_menu_button()])
-        )
-    elif data == "noop":
-        await query.answer("Это информационная кнопка")
-    else:
-        await query.answer("Функция в разработке")
-
-async def start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Возврат в главное меню."""
-    query = update.callback_query
-    await query.answer()
-    
-    user = update.effective_user
-    
-    text = f"""👋 Здравствуйте, {user.first_name}!
-
-Я ЛОР-Помощник — персональный медицинский бот, созданный врачом-оториноларингологом Денисом Казариным.
-
-👶 Врач ведет прием детей с 0 лет и взрослых
-
-🤖 Мои возможности:
-• 💊 Напоминания о приеме лекарств
-• 🩺 Напоминания об анализе
-• 📊 Отслеживание самочувствия
-• 📈 Статистика
-
-Выберите действие:"""
-    
-    await query.edit_message_text(text, reply_markup=get_start_keyboard(), parse_mode=None)
-
-# ============== ЕЖЕДНЕВНЫЕ ЗАДАЧИ ==============
-
-async def daily_mood_check(context: ContextTypes.DEFAULT_TYPE):
-    """Ежедневный опрос в 21:00."""
-    db = get_db()
-    try:
-        users = db.query(User).filter(User.is_active == True, User.is_banned == False).all()
-        for u in users:
-            try:
-                tz = pytz.timezone(get_user_timezone(u.user_id))
-                now = datetime.now(tz)
-                if 20 <= now.hour <= 22:
-                    await context.bot.send_message(
-                        chat_id=u.user_id,
-                        text="📊 Как вы себя чувствуете сегодня?\n\nОцените по 5-балльной шкале:",
-                        reply_markup=get_mood_keyboard()
-                    )
-            except Exception as e:
-                log.error(f"Ошибка опроса {u.user_id}: {e}")
-    finally:
-        db.close()
-
-async def scheduled_backup(context: ContextTypes.DEFAULT_TYPE):
-    """Плановый бэкап."""
-    backup_manager.create_backup("auto")
+# ============== ПРОВЕРКА ЦЕЛОСТНОСТИ ==============
 
 async def integrity_check(context: ContextTypes.DEFAULT_TYPE):
     """Ежечасная проверка целостности."""
@@ -3583,58 +2421,9 @@ async def integrity_check(context: ContextTypes.DEFAULT_TYPE):
             ana.paused_until = None
             log.info(f"🔄 Возобновлен анализ {ana.id}")
         
-        # Восстановление отложенных
-        for rem in db.query(Reminder).filter(
-            Reminder.status == 'postponed',
-            Reminder.postponed_until.isnot(None),
-            Reminder.postponed_until <= now
-        ):
-            rem.status = 'pending'
-            rem.postponed_until = None
-            scheduler.scheduler.add_job(
-                send_reminder_job,
-                trigger=DateTrigger(run_date=rem.scheduled_time),
-                id=f"{rem.reminder_type}_{rem.id}",
-                args=[rem.id],
-                replace_existing=True
-            )
-            log.info(f"🔄 Восстановлено напоминание {rem.id}")
-        
         db.commit()
         
-        # Проверка планировщика
-        pending = db.query(Reminder).filter(
-            Reminder.status == 'pending',
-            Reminder.scheduled_time > now
-        ).all()
-        
-        pending_ids = {f"{r.reminder_type}_{r.id}" for r in pending}
-        job_ids = {job.id for job in scheduler.scheduler.get_jobs()}
-        
-        # Восстановление пропущенных
-        for job_id in pending_ids - job_ids:
-            rid = int(job_id.split('_')[1])
-            rem = db.query(Reminder).filter_by(id=rid).first()
-            if rem and rem.scheduled_time > now:
-                scheduler.scheduler.add_job(
-                    send_reminder_job,
-                    trigger=DateTrigger(run_date=rem.scheduled_time),
-                    id=job_id,
-                    args=[rid],
-                    replace_existing=True
-                )
-                log.warning(f"🔄 Восстановлено задание {job_id}")
-        
-        # Удаление мертвых
-        for job_id in job_ids - pending_ids:
-            if job_id.startswith(('medicine_', 'analysis_')):
-                try:
-                    scheduler.scheduler.remove_job(job_id)
-                    log.info(f"🗑️ Удалено мертвое задание {job_id}")
-                except:
-                    pass
-        
-        # Просроченные
+        # Проверка просроченных
         overdue = db.query(Reminder).filter(
             Reminder.status == 'pending',
             Reminder.scheduled_time <= now
@@ -3650,7 +2439,173 @@ async def integrity_check(context: ContextTypes.DEFAULT_TYPE):
     finally:
         db.close()
 
-# ============== ОТМЕНА ==============
+# ============== ОБРАБОТЧИК КНОПОК ==============
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Главный обработчик кнопок."""
+    query = update.callback_query
+    data = query.data
+    
+    # Навигация
+    if data == "start":
+        await start_callback(update, context)
+    elif data == "help":
+        await help_command(update, context)
+    elif data == "about":
+        await about_command(update, context)
+    elif data == "stats":
+        await stats_command(update, context)
+    elif data.startswith("stats_"):
+        await stats_callback(update, context)
+    
+    # Основные функции
+    elif data == "add_medicine":
+        await add_medicine_start(update, context)
+    elif data == "add_analysis":
+        await add_analysis_start(update, context)
+    elif data == "list_medicines":
+        await list_medicines(update, context)
+    elif data == "list_analyses":
+        await list_analyses(update, context)
+    elif data.startswith("delete_medicine_"):
+        await delete_medicine(update, context)
+    elif data.startswith("delete_analysis_"):
+        await delete_analysis(update, context)
+    
+    # Самочувствие
+    elif data == "mood":
+        await mood_command(update, context)
+    elif data.startswith("mood_"):
+        await mood_callback(update, context)
+    
+    # Прием лекарств
+    elif data.startswith("take_"):
+        await medicine_take(update, context)
+    elif data.startswith("skip_"):
+        await medicine_skip(update, context)
+    elif data.startswith("analysis_take_"):
+        await analysis_take(update, context)
+    elif data.startswith("analysis_skip_"):
+        await analysis_skip(update, context)
+    
+    # Админ-панель
+    elif data == "admin_panel":
+        await admin_command(update, context)
+    elif data == "admin_stats":
+        await admin_stats_callback(update, context)
+    elif data == "admin_users":
+        await admin_users_callback(update, context)
+    elif data == "admin_users_list":
+        await admin_users_list_callback(update, context)
+    elif data == "admin_logs":
+        await admin_logs_callback(update, context)
+    elif data == "admin_logs_errors":
+        await admin_logs_errors_callback(update, context)
+    elif data == "admin_backups":
+        await admin_backups_callback(update, context)
+    elif data == "admin_backup_create":
+        await admin_backup_create_callback(update, context)
+    elif data == "admin_backup_list":
+        await admin_backup_list_callback(update, context)
+    
+    # Телефоны
+    elif data == "phone_kit":
+        await query.answer()
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text=f"📞 Телефон КИТ-клиники: {KIT_CLINIC['phone_display']}\n\nНажмите на номер: {KIT_CLINIC['phone']}",
+            reply_markup=InlineKeyboardMarkup([get_main_menu_button()])
+        )
+    elif data == "phone_family":
+        await query.answer()
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text=f"📞 Телефон Семейной клиники: {FAMILY_CLINIC['phone_display']}\n\nНажмите на номер: {FAMILY_CLINIC['phone']}",
+            reply_markup=InlineKeyboardMarkup([get_main_menu_button()])
+        )
+    else:
+        await query.answer("Функция в разработке")
+
+async def start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Возврат в главное меню."""
+    query = update.callback_query
+    await query.answer()
+    
+    text = f"""👋 Здравствуйте, {update.effective_user.first_name}!
+
+Я ЛОР-Помощник — персональный медицинский бот.
+
+👶 Врач ведет прием детей с 0 лет и взрослых
+
+🤖 Мои возможности:
+• 💊 Напоминания о лекарствах
+• 🩺 Напоминания об анализах
+• 📊 Отслеживание самочувствия
+• 📈 Статистика
+
+Выберите действие:"""
+    
+    await query.edit_message_text(text, reply_markup=get_start_keyboard(), parse_mode=None)
+
+# ============== ПЛАНОВЫЕ ЗАДАЧИ ==============
+
+async def scheduled_backup(context: ContextTypes.DEFAULT_TYPE):
+    """Плановый бэкап."""
+    backup_manager.create_backup("auto")
+
+# ============== СОЗДАНИЕ ПРИЛОЖЕНИЯ ==============
+
+def create_application():
+    """Создание приложения."""
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.scheduler = scheduler.scheduler
+    
+    # Команды
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("about", about_command))
+    app.add_handler(CommandHandler("admin", admin_command))
+    
+    # ConversationHandler для лекарств
+    medicine_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(add_medicine_start, pattern="^add_medicine$")],
+        states={
+            MEDICINE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_medicine_name)],
+            MEDICINE_TIME_HOUR: [CallbackQueryHandler(add_medicine_hour, pattern="^med_hour_")],
+            MEDICINE_TIME_MINUTE: [CallbackQueryHandler(add_medicine_minute, pattern="^med_minute_")],
+            MEDICINE_CONFIRM: [CallbackQueryHandler(add_medicine_confirm, pattern="^confirm_medicine$")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        name="add_medicine"
+    )
+    
+    # ConversationHandler для анализов
+    analysis_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(add_analysis_start, pattern="^add_analysis$")],
+        states={
+            ANALYSIS_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_analysis_name)],
+            ANALYSIS_DATE: [
+                CallbackQueryHandler(add_analysis_date, pattern="^analysis_date_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_analysis_date)
+            ],
+            ANALYSIS_TIME_HOUR: [CallbackQueryHandler(add_analysis_hour, pattern="^ana_hour_")],
+            ANALYSIS_TIME_MINUTE: [CallbackQueryHandler(add_analysis_minute, pattern="^ana_minute_")],
+            ANALYSIS_CONFIRM: [CallbackQueryHandler(add_analysis_confirm, pattern="^confirm_analysis$")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        name="add_analysis"
+    )
+    
+    # Добавляем обработчики
+    app.add_handler(medicine_conv)
+    app.add_handler(analysis_conv)
+    app.add_handler(CallbackQueryHandler(button_callback))
+    
+    # Плановые задачи
+    app.job_queue.run_repeating(integrity_check, interval=3600, first=10, name="integrity")
+    app.job_queue.run_daily(scheduled_backup, time=datetime.strptime("03:00", "%H:%M").time(), name="daily_backup")
+    
+    return app
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отмена операции."""
@@ -3668,165 +2623,18 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     return ConversationHandler.END
 
-# ============== СОЗДАНИЕ ПРИЛОЖЕНИЯ ==============
-
-def create_application():
-    """Создание приложения."""
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.scheduler = scheduler.scheduler
-    
-    # Команды
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("about", about_command))
-    app.add_handler(CommandHandler("settimezone", set_timezone_command))
-    app.add_handler(CommandHandler("mood", mood_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("list", list_medicines))
-    app.add_handler(CommandHandler("list_medicines", list_medicines))
-    app.add_handler(CommandHandler("list_analyses", list_analyses))
-    app.add_handler(CommandHandler("extra", extra_medicine_start))
-    app.add_handler(CommandHandler("admin", admin_command))
-    
-    # ConversationHandler для лекарств
-    medicine_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(add_medicine_start, pattern="^add_medicine$")],
-        states={
-            MEDICINE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_medicine_name)],
-            MEDICINE_FREQUENCY: [
-                CallbackQueryHandler(add_medicine_frequency, pattern="^med_freq_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_medicine_frequency)
-            ],
-            MEDICINE_TIME: [
-                CallbackQueryHandler(add_medicine_time_hour, pattern="^med_time_hour_"),
-                CallbackQueryHandler(add_medicine_time_minute, pattern="^med_time_minute_"),
-            ],
-            MEDICINE_REMINDER: [
-                CallbackQueryHandler(add_medicine_reminder, pattern="^med_remind_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_medicine_reminder)
-            ],
-            MEDICINE_CONFIRM: [CallbackQueryHandler(add_medicine_confirm, pattern="^confirm_medicine$")],
-        },
-        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern="^cancel$")],
-        name="add_medicine"
-    )
-    
-    # ConversationHandler для анализов
-    analysis_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(add_analysis_start, pattern="^add_analysis$")],
-        states={
-            ANALYSIS_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_analysis_name)],
-            ANALYSIS_DATE: [
-                CallbackQueryHandler(add_analysis_date, pattern="^analysis_date_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_analysis_date)
-            ],
-            ANALYSIS_TIME: [
-                CallbackQueryHandler(add_analysis_time_hour, pattern="^ana_hour_"),
-                CallbackQueryHandler(add_analysis_time_minute, pattern="^ana_minute_"),
-            ],
-            ANALYSIS_REMINDER: [
-                CallbackQueryHandler(add_analysis_reminder, pattern="^ana_remind_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_analysis_reminder)
-            ],
-            ANALYSIS_CONFIRM: [CallbackQueryHandler(add_analysis_confirm, pattern="^confirm_analysis$")],
-        },
-        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern="^cancel$")],
-        name="add_analysis"
-    )
-    
-    # ConversationHandler для симптомов
-    symptom_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("symptoms", symptoms_command),
-            CallbackQueryHandler(symptoms_command, pattern="^symptoms$")
-        ],
-        states={
-            SYMPTOM_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, symptom_text)],
-            SYMPTOM_SEVERITY: [CallbackQueryHandler(symptom_severity, pattern="^severity_")],
-        },
-        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern="^cancel$")],
-        name="add_symptom"
-    )
-    
-    # ConversationHandler для экстренного приема
-    extra_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("extra", extra_medicine_start),
-            CallbackQueryHandler(extra_medicine_start, pattern="^extra_medicine$")
-        ],
-        states={
-            EXTRA_MEDICINE_SELECT: [CallbackQueryHandler(extra_medicine_select, pattern="^extra_select_")],
-            MEDICINE_DOSAGE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, extra_medicine_dosage),
-                CallbackQueryHandler(extra_medicine_dosage, pattern="^skip_dosage$")
-            ],
-            MEDICINE_COMMENT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, extra_medicine_comment),
-                CallbackQueryHandler(extra_medicine_comment, pattern="^skip_comment$")
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern="^cancel$")],
-        name="extra_medicine"
-    )
-    
-    # ConversationHandler для комментариев
-    comment_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(medicine_comment_start, pattern="^comment_")],
-        states={
-            MEDICINE_COMMENT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, medicine_comment_save),
-                CallbackQueryHandler(medicine_comment_type, pattern="^comment_symptom_|^comment_side_|^comment_normal_")
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern="^cancel$")],
-        name="comment_medicine"
-    )
-    
-    # ConversationHandler для откладывания анализов
-    postpone_analysis_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(postpone_analysis_start, pattern="^postpone_analysis_")],
-        states={
-            POSTPONE_ANALYSIS: [
-                CallbackQueryHandler(postpone_analysis_days, pattern="^postpone_analysis_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, postpone_analysis_days)
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern="^cancel$")],
-        name="postpone_analysis"
-    )
-    
-    # Добавляем все обработчики
-    app.add_handler(medicine_conv)
-    app.add_handler(analysis_conv)
-    app.add_handler(symptom_conv)
-    app.add_handler(extra_conv)
-    app.add_handler(comment_conv)
-    app.add_handler(postpone_analysis_conv)
-    
-    # Обработчик кнопок
-    app.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Плановые задачи
-    app.job_queue.run_repeating(integrity_check, interval=3600, first=10, name="integrity")
-    app.job_queue.run_daily(daily_mood_check, time=datetime.strptime("21:00", "%H:%M").time(), name="daily_mood")
-    app.job_queue.run_daily(scheduled_backup, time=datetime.strptime("03:00", "%H:%M").time(), name="daily_backup")
-    
-    return app
-
 # ============== ЗАПУСК ==============
 
 async def main():
     """Главная функция."""
     global application, error_notifier
     
-    if BOT_TOKEN == "ВАШ_ТОКЕН_ЗДЕСЬ":
+    if BOT_TOKEN == "8515765315:AAEufR-gJQUZCux_kC0yDfmHRZf2QLgacUk":
         print("\n" + "="*50)
-        print("⚠️  ВНИМАНИЕ! Необходимо установить токен бота!")
+        print("✅ Токен установлен")
         print("="*50)
-        return
     
     print("🚀 Запуск ЛОР-Помощника...")
-    print(f"📊 Версия: 11.0.0 (Новая логика)")
     print(f"📁 Данные: {DATA_DIR}")
     print(f"📁 Бэкапы: {BACKUP_DIR}")
     print(f"📁 Логи: {LOG_DIR}")
@@ -3859,18 +2667,17 @@ async def main():
     
     print("✅ Бот запущен и готов к работе!")
     print("📝 Логи пишутся в /app/logs")
-    print("💡 Отправьте /start в Telegram: @NEW_lor_helper_bot")
-    print("⏎ Нажмите Ctrl+C для остановки")
+    print("💡 Отправьте /start в Telegram")
     
     await application.initialize()
     await application.start()
-    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     
     try:
         while True:
             await asyncio.sleep(1)
     except KeyboardInterrupt:
-        print("\n\n🛑 Бот остановлен")
+        print("\n🛑 Бот остановлен")
     finally:
         await application.updater.stop()
         await application.stop()
@@ -3879,9 +2686,7 @@ async def main():
             scheduler.shutdown()
         if error_notifier:
             await error_notifier.stop()
-        log.info("SHUTDOWN - Бот остановлен корректно")
-
-# ============== ТОЧКА ВХОДА ==============
+        log.info("SHUTDOWN - Бот остановлен")
 
 if __name__ == "__main__":
     try:
